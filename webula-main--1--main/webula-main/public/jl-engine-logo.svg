@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="JL Engine logo">
+  <rect width="512" height="512" rx="64" fill="#040607" />
+  <rect x="32" y="32" width="448" height="448" rx="48" fill="#0b0f18" stroke="#0a141f" stroke-width="2" />
+  <rect x="80" y="60" width="352" height="34" rx="12" fill="#0f7f43" opacity="0.8" />
+  <rect x="160" y="120" width="192" height="192" rx="40" fill="#081216" stroke="#27ff9e" stroke-width="6" />
+  <rect x="180" y="150" width="152" height="152" rx="32" fill="#061011" stroke="#57ff9b" stroke-width="4" />
+  <circle cx="256" cy="196" r="32" fill="#0cf09a" opacity="0.85" />
+  <text x="256" y="310" text-anchor="middle" font-family="Segoe UI, SF Pro Display, sans-serif" font-size="48" fill="#26ff99" font-weight="700">
+    JL ENGINE
+  </text>
+  <text x="256" y="345" text-anchor="middle" font-family="Segoe UI, SF Pro Display, sans-serif" font-size="20" fill="#c9e8ff">
+    Engineering Intelligence
+  </text>
+  <g fill="#38ffac" font-family="Courier New, monospace" font-size="12" letter-spacing="4">
+    <text x="90" y="380">10 01 11 00</text>
+    <text x="90" y="398">00 11 01 10</text>
+    <text x="90" y="416">01 10 10 11</text>
+    <text x="310" y="380">11 01 00 11</text>
+    <text x="310" y="398">10 10 01 01</text>
+    <text x="310" y="416">11 01 10 10</text>
+  </g>
+</svg>

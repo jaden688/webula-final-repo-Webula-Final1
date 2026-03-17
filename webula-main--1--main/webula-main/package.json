@@ -1,0 +1,76 @@
+{
+  "name": "neural-explorer-launcher",
+  "private": true,
+  "version": "0.0.0",
+  "main": "electron/main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:desktop": "concurrently -k \"npm run dev\" \"wait-on tcp:4000 && electron .\"",
+    "desktop": "electron .",
+    "start": "npm run dev",
+    "icons:generate": "node scripts/generate-icons.mjs",
+    "run:mpf": "node scripts/run-jl-engine-mpf.mjs",
+    "chat:sparkbyte": "node scripts/run-jl-engine-mpf.mjs sparkbyte",
+    "build": "vite build",
+    "preview": "vite preview",
+    "dist:win": "npm run icons:generate && npm run build && electron-builder --win nsis",
+    "dist:dir": "npm run icons:generate && npm run build && electron-builder --dir"
+  },
+  "dependencies": {
+    "@vercel/analytics": "^1.6.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-force-graph-3d": "^1.29.0",
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.182.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.2.1",
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12",
+    "png-to-ico": "^2.1.8",
+    "typescript": "^5.5.4",
+    "vite": "^7.3.1",
+    "wait-on": "^9.0.1"
+  },
+  "build": {
+    "appId": "com.jlin.webula",
+    "productName": "Webula",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Webula-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico"
+    }
+  },
+  "overrides": {
+    "three": "^0.182.0"
+  }
+}
