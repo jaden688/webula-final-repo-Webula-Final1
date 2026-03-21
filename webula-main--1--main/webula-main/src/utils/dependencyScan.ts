@@ -1,3 +1,5 @@
+import { analyzeTextFile, type FileIntelligence } from './fileIntelligence';
+
 type NodeType = 'folder' | 'file' | 'image' | 'code' | 'external';
 
 export interface DependencyInfo {
@@ -5,6 +7,7 @@ export interface DependencyInfo {
   external: string[];
   unresolved: string[];
   exports: string[];
+  analysis?: FileIntelligence;
 }
 
 export interface DependencyScanSettings {
@@ -39,7 +42,15 @@ export interface DependencyScanResult {
   externalNodes: DependencyScanNode[];
   dependencyMap: Record<string, DependencyInfo>;
   reverseDependencyMap: Record<string, string[]>;
-  stats: { filesParsed: number; depLinks: number; externalCount: number };
+  stats: {
+    filesParsed: number;
+    depLinks: number;
+    externalCount: number;
+    analyzedFiles?: number;
+    symbolCount?: number;
+    packageCount?: number;
+    headingCount?: number;
+  };
 }
 
 const CODE_IMPORT_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.jl', '.json', '.toml'];
@@ -256,6 +267,10 @@ export const scanDependencies = async (
   const externalClusterId = 'external:cluster';
   const codeNodes = tree.nodes.filter((node) => node.type === 'code' && node.handle);
   let parsedCount = 0;
+  let analyzedCount = 0;
+  let symbolCount = 0;
+  let packageCount = 0;
+  let headingCount = 0;
 
   const addLink = (source: string, target: string) => {
     const key = `${source}->${target}|dep`;
@@ -273,8 +288,16 @@ export const scanDependencies = async (
     if (file.size > maxSizeBytes) continue;
 
     const text = await file.text();
+    const analysis = analyzeTextFile(file.name, text);
     const { imports, exports } = extractImportsAndExports(file.name, text);
-    const info: DependencyInfo = { internal: [], external: [], unresolved: [], exports: [] };
+    const info: DependencyInfo = { internal: [], external: [], unresolved: [], exports: [], analysis };
+
+    analyzedCount += 1;
+    symbolCount += analysis.symbols.length;
+    headingCount += analysis.headings.length;
+    if (analysis.packageSummary) {
+      packageCount += 1;
+    }
 
     exports.forEach((name) => pushUnique(info.exports, name));
     const isPython = getExt(file.name) === '.py';
@@ -340,6 +363,7 @@ export const scanDependencies = async (
       external: info.external.slice().sort(),
       unresolved: info.unresolved.slice().sort(),
       exports: info.exports.slice().sort(),
+      analysis,
     };
 
     parsedCount += 1;
@@ -354,6 +378,10 @@ export const scanDependencies = async (
       filesParsed: parsedCount,
       depLinks: depLinks.length,
       externalCount: externalNodeMap.size,
+      analyzedFiles: analyzedCount,
+      symbolCount,
+      packageCount,
+      headingCount,
     },
   };
 };

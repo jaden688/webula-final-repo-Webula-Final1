@@ -3,11 +3,14 @@ import ForceGraph3D from 'react-force-graph-3d';
 import * as THREE from 'three';
 import { scanDependencies } from '../../src/utils/dependencyScan';
 import type { DependencyInfo } from '../../src/utils/dependencyScan';
+import { analyzeTextFile, type FileIntelligence } from '../../src/utils/fileIntelligence';
 import {
   chatWithOllama,
   DEFAULT_OLLAMA_BASE_URL,
   DEFAULT_OLLAMA_MODEL,
   MAX_OLLAMA_REVIEW_CHARS,
+  buildOllamaCorsHint,
+  formatOllamaError,
   type OllamaChatMessage,
   reviewCodeWithOllama,
 } from '../../src/utils/ollamaReviewer';
@@ -48,6 +51,33 @@ interface OllamaTagsResponse {
     name?: string;
     model?: string;
   }>;
+}
+
+interface DependencyStats {
+  filesParsed: number;
+  depLinks: number;
+  externalCount: number;
+  analyzedFiles?: number;
+  symbolCount?: number;
+  packageCount?: number;
+  headingCount?: number;
+}
+
+interface WorkspaceSummary {
+  manifestFiles: Array<{
+    id: string;
+    label: string;
+    packageName?: string;
+    dependencyCount: number;
+    devDependencyCount: number;
+    scripts: string[];
+    entryPoints: string[];
+  }>;
+  frameworkHints: string[];
+  entryPoints: string[];
+  scripts: string[];
+  headings: string[];
+  symbols: string[];
 }
 
 interface Settings {
@@ -362,7 +392,7 @@ const NeuralExplorer3D: React.FC = () => {
   const [externalNodes, setExternalNodes] = useState<FileNode[]>([]);
   const [dependencyMap, setDependencyMap] = useState<Record<string, DependencyInfo>>({});
   const [reverseDependencyMap, setReverseDependencyMap] = useState<Record<string, string[]>>({});
-  const [dependencyStats, setDependencyStats] = useState<{ filesParsed: number; depLinks: number; externalCount: number } | null>(null);
+  const [dependencyStats, setDependencyStats] = useState<DependencyStats | null>(null);
   const [isParsingDeps, setIsParsingDeps] = useState(false);
   const fgRef = useRef<any>();
   const starsRef = useRef<THREE.Points | null>(null);
@@ -390,6 +420,7 @@ const NeuralExplorer3D: React.FC = () => {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const previewUrlRef = useRef<string | null>(null);
+  const [selectedFileAnalysis, setSelectedFileAnalysis] = useState<FileIntelligence | null>(null);
   const [editorContent, setEditorContent] = useState<string | null>(null);
   const [editorLoadedContent, setEditorLoadedContent] = useState<string | null>(null);
   const [isEditorDirty, setIsEditorDirty] = useState(false);
@@ -573,6 +604,55 @@ const NeuralExplorer3D: React.FC = () => {
   const nodeDeps = selectedNode ? dependencyMap[selectedNode.id] : null;
   const nodeDependents = selectedNode ? reverseDependencyMap[selectedNode.id] ?? [] : [];
   const selectedGraphNodeId = selectedNode?.id ?? null;
+  const selectedAnalysis = selectedFileAnalysis ?? nodeDeps?.analysis ?? null;
+  const workspaceSummary = useMemo<WorkspaceSummary | null>(() => {
+    const analyzedEntries = Object.entries(dependencyMap)
+      .flatMap(([id, info]) => (info.analysis ? [{ id, info }] : []));
+
+    if (analyzedEntries.length === 0) return null;
+
+    const manifestFiles = analyzedEntries
+      .filter(({ info }) => info.analysis?.packageSummary)
+      .slice(0, 4)
+      .map(({ id, info }) => {
+        const node = treeData.nodes.find((candidate) => candidate.id === id);
+        const packageSummary = info.analysis?.packageSummary;
+        return {
+          id,
+          label: formatPathLabel(node?.path ?? id),
+          packageName: packageSummary?.name,
+          dependencyCount: packageSummary?.dependencyCount ?? 0,
+          devDependencyCount: packageSummary?.devDependencyCount ?? 0,
+          scripts: packageSummary?.scripts.slice(0, 5) ?? [],
+          entryPoints: info.analysis?.entryPoints.slice(0, 5) ?? [],
+        };
+      });
+
+    const frameworkHints = new Set<string>();
+    const entryPoints = new Set<string>();
+    const scripts = new Set<string>();
+    const headings = new Set<string>();
+    const symbols = new Set<string>();
+
+    analyzedEntries.forEach(({ info }) => {
+      const analysis = info.analysis;
+      if (!analysis) return;
+      analysis.frameworkHints.forEach((hint) => frameworkHints.add(hint));
+      analysis.entryPoints.forEach((entry) => entryPoints.add(entry));
+      analysis.scripts.forEach((script) => scripts.add(script));
+      analysis.headings.forEach((heading) => headings.add(heading));
+      analysis.symbols.slice(0, 4).forEach((symbol) => symbols.add(symbol));
+    });
+
+    return {
+      manifestFiles,
+      frameworkHints: Array.from(frameworkHints).slice(0, 8),
+      entryPoints: Array.from(entryPoints).slice(0, 8),
+      scripts: Array.from(scripts).slice(0, 8),
+      headings: Array.from(headings).slice(0, 8),
+      symbols: Array.from(symbols).slice(0, 8),
+    };
+  }, [dependencyMap, treeData.nodes]);
   const adjacencyMap = useMemo(() => {
     const map = new Map<string, Set<string>>();
     graphData.links.forEach((link) => {
@@ -1405,7 +1485,7 @@ const NeuralExplorer3D: React.FC = () => {
         setOllamaModelsError('Ollama is reachable, but no local models were returned.');
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to load models from Ollama.';
+      const message = formatOllamaError(error, normalizedBaseUrl) || 'Unable to load models from Ollama.';
       setAvailableOllamaModels([]);
       setOllamaModelsError(message);
     } finally {
@@ -1520,6 +1600,7 @@ const NeuralExplorer3D: React.FC = () => {
       setPreviewText(null);
       setPreviewError(null);
       setIsPreviewLoading(false);
+      setSelectedFileAnalysis(null);
       setEditorContent(null);
       setEditorLoadedContent(null);
       setIsEditorDirty(false);
@@ -1560,9 +1641,11 @@ const NeuralExplorer3D: React.FC = () => {
         } else if (isTextPreviewable(file, selectedNode.name)) {
           const text = await file.text();
           if (cancelled) return;
+          const analysis = analyzeTextFile(selectedNode.name, text);
           const trimmed = text.slice(0, MAX_PREVIEW_CHARS);
           const lines = trimmed.split(/\r?\n/).slice(0, MAX_PREVIEW_LINES);
           setPreviewText(lines.join('\n') || '(empty file)');
+          setSelectedFileAnalysis(analysis);
           const editorBuffer = text.slice(0, MAX_EDITOR_CHARS);
           setEditorContent(editorBuffer);
           setEditorLoadedContent(editorBuffer);
@@ -1650,6 +1733,7 @@ const NeuralExplorer3D: React.FC = () => {
     ? `${activeOllamaModel.slice(0, 21)}...`
     : activeOllamaModel;
   const isModelSwitchBusy = isReviewingCode || isChattingWithModel;
+  const ollamaCorsHint = buildOllamaCorsHint(ollamaBaseUrl);
   const leftPanelWidth = isLeftCollapsed ? collapsedWidth : leftWidth;
   const rightPanelWidth = isRightCollapsed ? collapsedWidth : rightWidth;
 
@@ -1951,6 +2035,52 @@ const NeuralExplorer3D: React.FC = () => {
                 {reconnectStatus}
               </div>
             )}
+            {workspaceSummary && (
+              <div
+                style={{
+                  ...cardStyle,
+                  marginTop: '10px',
+                  padding: '10px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '6px',
+                }}
+              >
+                <div style={{ fontSize: '0.72rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc' }}>
+                  Workspace Intelligence
+                </div>
+                {workspaceSummary.frameworkHints.length > 0 && (
+                  <div style={{ fontSize: '0.7rem', color: '#c6d9f3', lineHeight: 1.45 }}>
+                    Stack: {workspaceSummary.frameworkHints.slice(0, 4).join(', ')}
+                    {workspaceSummary.frameworkHints.length > 4 ? '...' : ''}
+                  </div>
+                )}
+                {workspaceSummary.manifestFiles.length > 0 && (
+                  <div style={{ fontSize: '0.7rem', color: '#9eb2cc', lineHeight: 1.45 }}>
+                    Manifests: {workspaceSummary.manifestFiles.slice(0, 3).map((item) => item.label).join(', ')}
+                    {workspaceSummary.manifestFiles.length > 3 ? '...' : ''}
+                  </div>
+                )}
+                {workspaceSummary.entryPoints.length > 0 && (
+                  <div style={{ fontSize: '0.7rem', color: '#9eb2cc', lineHeight: 1.45 }}>
+                    Entry points: {workspaceSummary.entryPoints.slice(0, 3).map(formatPathLabel).join(', ')}
+                    {workspaceSummary.entryPoints.length > 3 ? '...' : ''}
+                  </div>
+                )}
+                {workspaceSummary.scripts.length > 0 && (
+                  <div style={{ fontSize: '0.7rem', color: '#9eb2cc', lineHeight: 1.45 }}>
+                    Scripts: {workspaceSummary.scripts.slice(0, 4).join(', ')}
+                    {workspaceSummary.scripts.length > 4 ? '...' : ''}
+                  </div>
+                )}
+                {workspaceSummary.headings.length > 0 && (
+                  <div style={{ fontSize: '0.7rem', color: '#7f96b2', lineHeight: 1.45 }}>
+                    Docs: {workspaceSummary.headings.slice(0, 3).join(' | ')}
+                    {workspaceSummary.headings.length > 3 ? '...' : ''}
+                  </div>
+                )}
+              </div>
+            )}
             <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
               <div style={sectionTitleStyle}>Files</div>
               <div style={{ flex: 1, overflowY: 'auto', paddingRight: '6px', maxHeight: '100%' }}>
@@ -2058,6 +2188,74 @@ const NeuralExplorer3D: React.FC = () => {
                   <div style={{ fontSize: '0.7rem', opacity: 0.6 }}>Preview unavailable.</div>
                 )}
               </div>
+              {selectedAnalysis && (
+                <div
+                  style={{
+                    marginTop: '14px',
+                    padding: '10px',
+                    borderRadius: '10px',
+                    border: '1px solid rgba(255, 255, 255, 0.08)',
+                    background: 'rgba(6, 8, 14, 0.6)',
+                  }}
+                >
+                  <div style={{ fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc', marginBottom: '8px' }}>
+                    Parsed Structure
+                  </div>
+                  <div style={{ fontSize: '0.7rem', color: '#c6d9f3', lineHeight: 1.5 }}>
+                    <div>
+                      Kind: {selectedAnalysis.kind}
+                      {selectedAnalysis.language ? ` | Language: ${selectedAnalysis.language}` : ''}
+                    </div>
+                    <div>
+                      Lines: {selectedAnalysis.lineCount} | Chars: {selectedAnalysis.charCount.toLocaleString()} | Imports: {selectedAnalysis.imports.length} | Exports: {selectedAnalysis.exports.length}
+                    </div>
+                    {selectedAnalysis.packageSummary && (
+                      <div style={{ marginTop: '6px' }}>
+                        Package: {selectedAnalysis.packageSummary.name ?? selectedNode?.name ?? 'Unknown'}
+                        {selectedAnalysis.packageSummary.version ? ` @ ${selectedAnalysis.packageSummary.version}` : ''}
+                        {' | '}
+                        Deps: {selectedAnalysis.packageSummary.dependencyCount}
+                        {' / '}
+                        Dev: {selectedAnalysis.packageSummary.devDependencyCount}
+                      </div>
+                    )}
+                    {selectedAnalysis.entryPoints.length > 0 && (
+                      <div style={{ marginTop: '6px' }}>
+                        Entrypoints: {selectedAnalysis.entryPoints.slice(0, 4).join(', ')}
+                        {selectedAnalysis.entryPoints.length > 4 ? '...' : ''}
+                      </div>
+                    )}
+                    {selectedAnalysis.symbols.length > 0 && (
+                      <div style={{ marginTop: '6px' }}>
+                        Symbols: {selectedAnalysis.symbols.slice(0, 8).join(', ')}
+                        {selectedAnalysis.symbols.length > 8 ? '...' : ''}
+                      </div>
+                    )}
+                    {selectedAnalysis.headings.length > 0 && (
+                      <div style={{ marginTop: '6px' }}>
+                        Headings: {selectedAnalysis.headings.slice(0, 6).join(' | ')}
+                        {selectedAnalysis.headings.length > 6 ? '...' : ''}
+                      </div>
+                    )}
+                    {selectedAnalysis.configKeys.length > 0 && (
+                      <div style={{ marginTop: '6px' }}>
+                        Config keys: {selectedAnalysis.configKeys.slice(0, 8).join(', ')}
+                        {selectedAnalysis.configKeys.length > 8 ? '...' : ''}
+                      </div>
+                    )}
+                    {selectedAnalysis.frameworkHints.length > 0 && (
+                      <div style={{ marginTop: '6px' }}>
+                        Hints: {selectedAnalysis.frameworkHints.join(', ')}
+                      </div>
+                    )}
+                    {selectedAnalysis.notes.length > 0 && (
+                      <div style={{ marginTop: '6px', color: '#9db3d3' }}>
+                        {selectedAnalysis.notes.join(' ')}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
               {selectedNode && isEditorEligibleType(selectedNode.type) && !isEditorModalVisible && (
                 <div style={{ marginTop: '14px' }}>
                   <div style={{ fontSize: '0.7rem', opacity: 0.7, marginBottom: '6px' }}>
@@ -2135,6 +2333,22 @@ const NeuralExplorer3D: React.FC = () => {
                   <div style={{ fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc', marginBottom: '8px' }}>
                     Local Ollama Reviewer
                   </div>
+                  {ollamaCorsHint && (
+                    <div
+                      style={{
+                        marginBottom: '8px',
+                        padding: '8px 10px',
+                        borderRadius: '8px',
+                        border: '1px solid rgba(255, 180, 80, 0.25)',
+                        background: 'rgba(120, 70, 0, 0.14)',
+                        color: '#ffd8a6',
+                        fontSize: '0.66rem',
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      Hosted Webula can only reach a local Ollama server if Ollama allows this site origin. {ollamaCorsHint}
+                    </div>
+                  )}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                     <div>
                       <div style={{ fontSize: '0.68rem', color: '#7f96b2', marginBottom: '4px' }}>Base URL</div>
@@ -2549,7 +2763,7 @@ const NeuralExplorer3D: React.FC = () => {
                 />
                   </div>
                   <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Close Focus: {settings.focusDistanceClose}</div>
+            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Close Focus: {settings.focusDistanceClose}</div>
                 <input
                   type="range"
                   min={12}
@@ -2728,8 +2942,15 @@ const NeuralExplorer3D: React.FC = () => {
               />
             </div>
             {dependencyStats && (
-              <div style={{ fontSize: '0.7rem', color: '#7f96b2' }}>
-                Parsed {dependencyStats.filesParsed} files, {dependencyStats.depLinks} edges, {dependencyStats.externalCount} externals
+              <div style={{ fontSize: '0.7rem', color: '#7f96b2', lineHeight: 1.45 }}>
+                <div>
+                  Parsed {dependencyStats.filesParsed} files, {dependencyStats.depLinks} edges, {dependencyStats.externalCount} externals
+                </div>
+                {(dependencyStats.analyzedFiles !== undefined || dependencyStats.symbolCount !== undefined || dependencyStats.packageCount !== undefined || dependencyStats.headingCount !== undefined) && (
+                  <div>
+                    Parsed text: {dependencyStats.analyzedFiles ?? 0} | Symbols: {dependencyStats.symbolCount ?? 0} | Manifests: {dependencyStats.packageCount ?? 0} | Headings: {dependencyStats.headingCount ?? 0}
+                  </div>
+                )}
               </div>
             )}
               </div>
@@ -2783,6 +3004,7 @@ const NeuralExplorer3D: React.FC = () => {
             background: 'rgba(5, 8, 14, 0.7)',
             backdropFilter: 'blur(8px)',
             zIndex: 80,
+            pointerEvents: 'none',
             display: 'flex',
             alignItems: 'flex-start',
             justifyContent: 'center',
@@ -2793,6 +3015,7 @@ const NeuralExplorer3D: React.FC = () => {
           <div
             onClick={(event) => event.stopPropagation()}
             style={{
+              pointerEvents: 'auto',
               width: 'min(1100px, 96vw)',
               minHeight: '60vh',
               maxHeight: '85vh',
@@ -2884,6 +3107,21 @@ const NeuralExplorer3D: React.FC = () => {
                       <div style={{ fontSize: '0.72rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc' }}>
                         Local Ollama Reviewer
                       </div>
+                      {ollamaCorsHint && (
+                        <div
+                          style={{
+                            padding: '8px 10px',
+                            borderRadius: '8px',
+                            border: '1px solid rgba(255, 180, 80, 0.25)',
+                            background: 'rgba(120, 70, 0, 0.14)',
+                            color: '#ffd8a6',
+                            fontSize: '0.68rem',
+                            lineHeight: 1.45,
+                          }}
+                        >
+                          Hosted Webula can only reach a local Ollama server if Ollama allows this site origin. {ollamaCorsHint}
+                        </div>
+                      )}
                       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
                         <input
                           value={ollamaBaseUrl}

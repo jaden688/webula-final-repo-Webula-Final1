@@ -70,24 +70,63 @@ const nsToMs = (value?: number) => {
   return Math.round(value / 1_000_000);
 };
 
+const LOCAL_OLLAMA_BASE_URL_RE = /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/|$)/i;
+const FETCH_NETWORK_ERROR_RE = /Failed to fetch|NetworkError|CORS|ERR_FAILED/i;
+
+const getCurrentOrigin = () => {
+  if (typeof window === 'undefined' || !window.location?.origin) {
+    return '';
+  }
+  return window.location.origin;
+};
+
+export const buildOllamaCorsHint = (baseUrl?: string) => {
+  const normalizedBaseUrl = normalizeBaseUrl(baseUrl);
+  if (!LOCAL_OLLAMA_BASE_URL_RE.test(normalizedBaseUrl)) {
+    return '';
+  }
+
+  const origin = getCurrentOrigin();
+  const originLabel = origin || 'your app origin';
+  const originValue = origin || '<your-app-origin>';
+
+  return `If this app is running from ${originLabel}, Ollama must allow that origin. On the machine running Ollama, set OLLAMA_ORIGINS=${originValue} and restart Ollama, or run Webula locally instead of the hosted site.`;
+};
+
+export const formatOllamaError = (error: unknown, baseUrl?: string) => {
+  const message = error instanceof Error ? error.message : 'Unable to reach Ollama.';
+  const hint = buildOllamaCorsHint(baseUrl);
+
+  if (hint && FETCH_NETWORK_ERROR_RE.test(message)) {
+    return `${message} ${hint}`;
+  }
+
+  return message;
+};
+
 export const chatWithOllama = async (
   request: OllamaChatRequest,
 ): Promise<OllamaCodeReviewResult> => {
   const baseUrl = normalizeBaseUrl(request.baseUrl);
   const model = normalizeModel(request.model);
 
-  const response = await fetch(`${baseUrl}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      stream: false,
-      messages: request.messages,
-      options: {
-        temperature: request.temperature ?? 0.2,
-      },
-    }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        messages: request.messages,
+        options: {
+          temperature: request.temperature ?? 0.2,
+        },
+      }),
+    });
+  } catch (error) {
+    throw new Error(formatOllamaError(error, baseUrl));
+  }
 
   if (!response.ok) {
     let details = '';

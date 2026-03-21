@@ -43,6 +43,8 @@ Built for developers who want to *see* their codebase like a living neural netwo
 
 *Note*: Currently works best on small-to-medium projects (<400 files). Large codebases may hit browser memory/performance limits.
 
+*Note*: The hosted site can only talk to a local Ollama server if that Ollama instance allows the site origin through CORS. If you want `https://www.webulacode.com` to reach your local Ollama, start Ollama with `OLLAMA_ORIGINS=https://www.webulacode.com` on the machine running Ollama, then restart it. Otherwise, run Webula locally.
+
 ## Running Locally
 
 ### Windows (easiest)
