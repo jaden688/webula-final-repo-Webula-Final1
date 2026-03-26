@@ -1418,6 +1418,64 @@ const NeuralExplorer3D: React.FC = () => {
     setReconnectStatus('Reconnected.');
   };
 
+  // --- JL Engine Architecture Demo Data ---
+  const JL_ENGINE_ARCHITECTURE = {
+    nodes: [
+      {id: "EngineCore", label: "Engine Core", type: "code", path: "JL-Engine-local/src/engine/core"},
+      {id: "PlatformAPI", label: "Platform API", type: "code", path: "JL-Engine-local/src/platform/api"},
+      {id: "ToolSubsystem", label: "Tool Subsystem", type: "code", path: "JL-Engine-local/src/tools/subsystem"},
+      {id: "ControlPlane", label: "Control Plane", type: "code", path: "JL-Engine-local/src/control/plane"},
+      {id: "MemoryLattice", label: "Memory Lattice", type: "code", path: "JL-Engine-local/src/memory/lattice"},
+      {id: "TaskExecutor", label: "Task Executor", type: "code", path: "JL-Engine-local/src/task/executor"},
+      {id: "BehaviorEngine", label: "Behavior Engine", type: "code", path: "JL-Engine-local/src/behavior/engine"},
+      {id: "GearStack", label: "Gear Stack", type: "code", path: "JL-Engine-local/src/gear/stack"},
+      {id: "ConfigModule", label: "Config Module", type: "code", path: "JL-Engine-local/src/config/module"},
+      {id: "RuntimeContext", label: "Runtime Context", type: "code", path: "JL-Engine-local/src/runtime/context"},
+      {id: "EmotionAperture", label: "Emotion Aperture", type: "code", path: "JL-Engine-local/src/emotion/aperture"},
+      {id: "CognitiveMode", label: "Cognitive Mode", type: "code", path: "JL-Engine-local/src/cognitive/mode"},
+      {id: "ActionDirective", label: "Action Directive", type: "code", path: "JL-Engine-local/src/action/directive"},
+      {id: "StateSnapshot", label: "State Snapshot", type: "code", path: "JL-Engine-local/src/state/snapshot"},
+      {id: "AgentLattice", label: "Agent Lattice", type: "code", path: "JL-Engine-local/src/agent/lattice"}
+    ],
+    links: [
+      {source: "EngineCore", target: "PlatformAPI"},
+      {source: "EngineCore", target: "ToolSubsystem"},
+      {source: "EngineCore", target: "ControlPlane"},
+      {source: "EngineCore", target: "MemoryLattice"},
+      {source: "ControlPlane", target: "TaskExecutor"},
+      {source: "ControlPlane", target: "BehaviorEngine"},
+      {source: "BehaviorEngine", target: "GearStack"},
+      {source: "BehaviorEngine", target: "EmotionAperture"},
+      {source: "BehaviorEngine", target: "CognitiveMode"},
+      {source: "TaskExecutor", target: "ActionDirective"},
+      {source: "EngineCore", target: "ConfigModule"},
+      {source: "EngineCore", target: "RuntimeContext"},
+      {source: "RuntimeContext", target: "StateSnapshot"},
+      {source: "EngineCore", target: "AgentLattice"},
+      {source: "AgentLattice", target: "BehaviorEngine"}
+    ]
+  };
+
+  const loadJLEngineArchitecture = useCallback(() => {
+    const newData: GraphData = {
+      nodes: JL_ENGINE_ARCHITECTURE.nodes.map(n => ({
+        id: n.id,
+        name: n.label,
+        type: n.type,
+        sizeBytes: 1024
+      })),
+      links: JL_ENGINE_ARCHITECTURE.links.map(l => ({
+        source: l.source,
+        target: l.target
+      }))
+    };
+    setTreeData(newData);
+    setMountName('JL Engine Architecture');
+    setSelectedNodeId(null);
+    setSearchTerm('');
+    setTimeout(() => fgRef.current?.zoomToFit(600), 100);
+  }, []);
+
   // --- Search Logic ---
   const handleSearch = (e: React.ChangeEvent<HTMLInputElement>) => {
     const term = e.target.value;
@@ -1878,6 +1936,9 @@ const NeuralExplorer3D: React.FC = () => {
           }}
         >
           <button style={accentButtonStyle} onClick={handleMountFileSystem}>Mount Folder</button>
+          <button style={accentButtonStyle} onClick={loadJLEngineArchitecture} title="Load JL Engine Architecture Demo">
+            Load JL Engine
+          </button>
           <button
             style={{
               ...buttonStyle,
