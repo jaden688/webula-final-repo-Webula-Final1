@@ -5,14 +5,18 @@ import { scanDependencies } from '../../src/utils/dependencyScan';
 import type { DependencyInfo } from '../../src/utils/dependencyScan';
 import { analyzeTextFile, type FileIntelligence } from '../../src/utils/fileIntelligence';
 import {
-  chatWithOllama,
+  chatWithProvider,
+  type AiProvider,
+  DEFAULT_ANTHROPIC_MODEL,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_OPENAI_MODEL,
   DEFAULT_OLLAMA_BASE_URL,
   DEFAULT_OLLAMA_MODEL,
   MAX_OLLAMA_REVIEW_CHARS,
   buildOllamaCorsHint,
-  formatOllamaError,
+  formatOllamaError,  
   type OllamaChatMessage,
-  reviewCodeWithOllama,
+  reviewCodeWithProvider,
 } from '../../src/utils/ollamaReviewer';
 import { buildSparkByteInjectedFirstUserMessage } from '../../src/utils/sparkBytePromptInjection';
 
@@ -253,8 +257,13 @@ const isEditorEligibleType = (type?: NodeType | string | null) => type === 'code
 const LOGO_SRC = '/jl-engine-logo.jpg';
 const SETTINGS_STORAGE_KEY = 'neural-nexus-settings-v1';
 const LAYOUT_STORAGE_KEY = 'neural-nexus-layout-v1';
+const AI_PROVIDER_STORAGE_KEY = 'neural-nexus-ai-provider-v1';
 const OLLAMA_BASE_URL_STORAGE_KEY = 'neural-nexus-ollama-base-url-v1';
 const OLLAMA_MODEL_STORAGE_KEY = 'neural-nexus-ollama-model-v1';
+const CLOUD_MODEL_STORAGE_KEY = 'neural-nexus-cloud-model-v1';
+const OPENAI_KEY_STORAGE_KEY = 'neural-nexus-openai-key-v1';
+const GEMINI_KEY_STORAGE_KEY = 'neural-nexus-gemini-key-v1';
+const ANTHROPIC_KEY_STORAGE_KEY = 'neural-nexus-anthropic-key-v1';
 const ORBIT_SPEED_MULTIPLIER = 3;
 const MAX_CHAT_HISTORY_MESSAGES = 14;
 const MAX_CHAT_CONTEXT_CHARS = 16_000;
@@ -436,11 +445,30 @@ const NeuralExplorer3D: React.FC = () => {
   const [editorStatus, setEditorStatus] = useState<string | null>(null);
   const [canReconnect, setCanReconnect] = useState(false);
   const [reconnectStatus, setReconnectStatus] = useState<string | null>(null);
+  const [aiProvider, setAiProvider] = useState<AiProvider>(() => {
+    const stored = loadStoredText(AI_PROVIDER_STORAGE_KEY, 'ollama').toLowerCase();
+    if (stored === 'openai' || stored === 'gemini' || stored === 'anthropic' || stored === 'ollama') {
+      return stored;
+    }
+    return 'ollama';
+  });
   const [ollamaBaseUrl, setOllamaBaseUrl] = useState<string>(() => (
     loadStoredText(OLLAMA_BASE_URL_STORAGE_KEY, DEFAULT_OLLAMA_BASE_URL)
   ));
   const [ollamaModel, setOllamaModel] = useState<string>(() => (
     loadStoredText(OLLAMA_MODEL_STORAGE_KEY, DEFAULT_OLLAMA_MODEL)
+  ));
+  const [cloudModel, setCloudModel] = useState<string>(() => (
+    loadStoredText(CLOUD_MODEL_STORAGE_KEY, DEFAULT_OPENAI_MODEL)
+  ));
+  const [openaiApiKey, setOpenaiApiKey] = useState<string>(() => (
+    loadStoredText(OPENAI_KEY_STORAGE_KEY, '')
+  ));
+  const [geminiApiKey, setGeminiApiKey] = useState<string>(() => (
+    loadStoredText(GEMINI_KEY_STORAGE_KEY, '')
+  ));
+  const [anthropicApiKey, setAnthropicApiKey] = useState<string>(() => (
+    loadStoredText(ANTHROPIC_KEY_STORAGE_KEY, '')
   ));
   const [isTopBarModelEditorOpen, setIsTopBarModelEditorOpen] = useState(false);
   const [topBarModelDraft, setTopBarModelDraft] = useState('');
@@ -489,6 +517,28 @@ const NeuralExplorer3D: React.FC = () => {
   const [pulseStatus, setPulseStatus] = useState<string | null>(null);
 
   const [settings, setSettings] = useState<Settings>(() => loadStoredSettings());
+  const activeProviderModel = useMemo(() => {
+    if (aiProvider === 'ollama') {
+      return (ollamaModel || DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL;
+    }
+    const explicit = (cloudModel || '').trim();
+    if (explicit) return explicit;
+    if (aiProvider === 'openai') return DEFAULT_OPENAI_MODEL;
+    if (aiProvider === 'gemini') return DEFAULT_GEMINI_MODEL;
+    return DEFAULT_ANTHROPIC_MODEL;
+  }, [aiProvider, cloudModel, ollamaModel]);
+  const activeProviderApiKey = useMemo(() => {
+    if (aiProvider === 'openai') return openaiApiKey;
+    if (aiProvider === 'gemini') return geminiApiKey;
+    if (aiProvider === 'anthropic') return anthropicApiKey;
+    return '';
+  }, [aiProvider, anthropicApiKey, geminiApiKey, openaiApiKey]);
+  const activeProviderLabel = useMemo(() => {
+    if (aiProvider === 'openai') return 'OpenAI';
+    if (aiProvider === 'gemini') return 'Gemini';
+    if (aiProvider === 'anthropic') return 'Anthropic';
+    return 'Ollama';
+  }, [aiProvider]);
 
   const updateSetting = useCallback(<K extends keyof Settings>(key: K, value: Settings[K]) => {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -534,6 +584,35 @@ const NeuralExplorer3D: React.FC = () => {
       console.warn('Failed to persist Ollama model', error);
     }
   }, [ollamaModel]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(AI_PROVIDER_STORAGE_KEY, aiProvider);
+    } catch (error) {
+      console.warn('Failed to persist AI provider', error);
+    }
+  }, [aiProvider]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(CLOUD_MODEL_STORAGE_KEY, cloudModel);
+    } catch (error) {
+      console.warn('Failed to persist cloud model', error);
+    }
+  }, [cloudModel]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(OPENAI_KEY_STORAGE_KEY, openaiApiKey);
+      window.localStorage.setItem(GEMINI_KEY_STORAGE_KEY, geminiApiKey);
+      window.localStorage.setItem(ANTHROPIC_KEY_STORAGE_KEY, anthropicApiKey);
+    } catch (error) {
+      console.warn('Failed to persist API keys', error);
+    }
+  }, [anthropicApiKey, geminiApiKey, openaiApiKey]);
 
   const attachGraphRef = useCallback((instance: any) => {
     fgRef.current = instance;
@@ -989,11 +1068,13 @@ const NeuralExplorer3D: React.FC = () => {
     const codeForReview = editorContent.slice(0, MAX_OLLAMA_REVIEW_CHARS);
     setIsReviewingCode(true);
     setReviewError(null);
-    setReviewStatus(`Reviewing ${selectedNode.name} with ${ollamaModel || DEFAULT_OLLAMA_MODEL}...`);
+    setReviewStatus(`Reviewing ${selectedNode.name} with ${activeProviderLabel} (${activeProviderModel})...`);
     try {
-      const result = await reviewCodeWithOllama({
+      const result = await reviewCodeWithProvider({
+        provider: aiProvider,
         baseUrl: ollamaBaseUrl,
-        model: ollamaModel,
+        model: activeProviderModel,
+        apiKey: activeProviderApiKey,
         fileName: selectedNode.name,
         filePath: selectedNode.path,
         code: codeForReview,
@@ -1009,14 +1090,14 @@ const NeuralExplorer3D: React.FC = () => {
       }
       setReviewStatus(statusParts.join(' | '));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Ollama review failed.';
+      const message = error instanceof Error ? error.message : 'AI review failed.';
       setReviewResult(null);
       setReviewError(message);
       setReviewStatus(null);
     } finally {
       setIsReviewingCode(false);
     }
-  }, [editorContent, ollamaBaseUrl, ollamaModel, selectedNode]);
+  }, [activeProviderApiKey, activeProviderLabel, activeProviderModel, aiProvider, editorContent, ollamaBaseUrl, selectedNode]);
 
   const extractCodeBlockFromMessage = useCallback((content: string) => {
     let match: RegExpExecArray | null;
@@ -1088,9 +1169,9 @@ const NeuralExplorer3D: React.FC = () => {
     setChatApplyStatus(null);
     setIsChattingWithModel(true);
     if (hasPriorUserTurn) {
-      setChatStatus(`Waiting on ${ollamaModel || DEFAULT_OLLAMA_MODEL}...`);
+      setChatStatus(`Waiting on ${activeProviderLabel} (${activeProviderModel})...`);
     } else {
-      setChatStatus(`Injected SparkByte MPF schema. Waiting on ${ollamaModel || DEFAULT_OLLAMA_MODEL}...`);
+      setChatStatus(`Injected SparkByte MPF schema. Waiting on ${activeProviderLabel} (${activeProviderModel})...`);
     }
 
     const codingSystemPrompt = [
@@ -1128,9 +1209,11 @@ const NeuralExplorer3D: React.FC = () => {
     });
 
     try {
-      const result = await chatWithOllama({
+      const result = await chatWithProvider({
+        provider: aiProvider,
         baseUrl: ollamaBaseUrl,
-        model: ollamaModel,
+        model: activeProviderModel,
+        apiKey: activeProviderApiKey,
         messages: ollamaMessages,
         temperature: 0.25,
       });
@@ -1144,13 +1227,13 @@ const NeuralExplorer3D: React.FC = () => {
       }
       setChatStatus(statusParts.join(' | '));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Ollama chat failed.';
+      const message = error instanceof Error ? error.message : 'AI chat failed.';
       setChatError(message);
       setChatStatus(null);
     } finally {
       setIsChattingWithModel(false);
     }
-  }, [chatInput, chatMessages, editorContent, ollamaBaseUrl, ollamaModel, selectedNode]);
+  }, [activeProviderApiKey, activeProviderLabel, activeProviderModel, aiProvider, chatInput, chatMessages, editorContent, ollamaBaseUrl, selectedNode]);
 
   const handleClearCodingChat = useCallback(() => {
     setChatMessages([]);
@@ -1902,7 +1985,7 @@ const NeuralExplorer3D: React.FC = () => {
     ? `${activeOllamaModel.slice(0, 21)}...`
     : activeOllamaModel;
   const isModelSwitchBusy = isReviewingCode || isChattingWithModel;
-  const ollamaCorsHint = buildOllamaCorsHint(ollamaBaseUrl);
+  const ollamaCorsHint = aiProvider === 'ollama' ? buildOllamaCorsHint(ollamaBaseUrl) : '';
   const leftPanelWidth = isLeftCollapsed ? collapsedWidth : leftWidth;
   const rightPanelWidth = isRightCollapsed ? collapsedWidth : rightWidth;
 
@@ -2070,16 +2153,18 @@ const NeuralExplorer3D: React.FC = () => {
           <button
             style={{
               ...buttonStyle,
-              opacity: isModelSwitchBusy ? 0.5 : 1,
-              cursor: isModelSwitchBusy ? 'not-allowed' : 'pointer',
+              opacity: isModelSwitchBusy || aiProvider !== 'ollama' ? 0.5 : 1,
+              cursor: isModelSwitchBusy || aiProvider !== 'ollama' ? 'not-allowed' : 'pointer',
             }}
             onClick={handleToggleTopBarModelEditor}
-            disabled={isModelSwitchBusy}
-            title={`Current Ollama model: ${activeOllamaModel}`}
+            disabled={isModelSwitchBusy || aiProvider !== 'ollama'}
+            title={aiProvider === 'ollama'
+              ? `Current Ollama model: ${activeOllamaModel}`
+              : `Switch provider/model in Controls tab (current: ${activeProviderLabel})`}
           >
-            Model: {topBarModelLabel}
+            Model: {aiProvider === 'ollama' ? topBarModelLabel : `${activeProviderLabel}`}
           </button>
-          {isTopBarModelEditorOpen && (
+          {isTopBarModelEditorOpen && aiProvider === 'ollama' && (
             <div
               style={{
                 display: 'flex',
@@ -2510,7 +2595,7 @@ const NeuralExplorer3D: React.FC = () => {
               {rightDockTab === 'chat' && (
                 <div style={cardStyle}>
                   <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>
-                    Coding Chat ({ollamaModel || DEFAULT_OLLAMA_MODEL})
+                    Coding Chat ({activeProviderLabel}: {activeProviderModel})
                   </div>
                   <div style={{ maxHeight: '320px', overflowY: 'auto', borderRadius: '8px', background: 'rgba(0, 0, 0, 0.35)', border: '1px solid rgba(255,255,255,0.06)', padding: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {chatMessages.length === 0 ? (
@@ -2578,26 +2663,37 @@ const NeuralExplorer3D: React.FC = () => {
 
               {rightDockTab === 'review' && (
                 <div style={cardStyle}>
-                  <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>Local Ollama Reviewer</div>
+                  <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>
+                    AI Reviewer ({activeProviderLabel}: {activeProviderModel})
+                  </div>
                   {ollamaCorsHint && (
                     <div style={{ marginBottom: '8px', padding: '8px 10px', borderRadius: '8px', border: '1px solid rgba(255,180,80,0.25)', background: 'rgba(120,70,0,0.14)', color: '#ffd8a6', fontSize: '0.68rem', lineHeight: 1.45 }}>
                       Hosted Webula can only reach a local Ollama server if Ollama allows this site origin. {ollamaCorsHint}
                     </div>
                   )}
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                    <input
-                      value={ollamaBaseUrl}
-                      onChange={(event) => setOllamaBaseUrl(event.target.value)}
-                      placeholder={DEFAULT_OLLAMA_BASE_URL}
-                      style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.72rem', outline: 'none' }}
-                    />
-                    <input
-                      value={ollamaModel}
-                      onChange={(event) => setOllamaModel(event.target.value)}
-                      placeholder={DEFAULT_OLLAMA_MODEL}
-                      style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.72rem', outline: 'none' }}
-                    />
-                  </div>
+                  {aiProvider === 'ollama' ? (
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                      <input
+                        value={ollamaBaseUrl}
+                        onChange={(event) => setOllamaBaseUrl(event.target.value)}
+                        placeholder={DEFAULT_OLLAMA_BASE_URL}
+                        style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.72rem', outline: 'none' }}
+                      />
+                      <input
+                        value={ollamaModel}
+                        onChange={(event) => setOllamaModel(event.target.value)}
+                        placeholder={DEFAULT_OLLAMA_MODEL}
+                        style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.72rem', outline: 'none' }}
+                      />
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: '0.72rem', color: '#9db3d3' }}>
+                      Using {activeProviderLabel} with model `{activeProviderModel}`.
+                      {!activeProviderApiKey.trim() && (
+                        <> Enter an API key in the Controls tab.</>
+                      )}
+                    </div>
+                  )}
                   <div style={{ display: 'flex', gap: '8px', marginTop: '8px', alignItems: 'center' }}>
                     <button style={accentButtonStyle} onClick={handleRunOllamaReview} disabled={isReviewingCode || !editorContent || !editorContent.trim()}>
                       {isReviewingCode ? 'Reviewing...' : 'Review Current File'}
@@ -2630,6 +2726,70 @@ const NeuralExplorer3D: React.FC = () => {
 
               {rightDockTab === 'controls' && (
                 <>
+                  <div style={cardStyle}>
+                    <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>AI Providers</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                      <select
+                        value={aiProvider}
+                        onChange={(event) => setAiProvider(event.target.value as AiProvider)}
+                        style={{
+                          width: '100%',
+                          background: 'rgba(4,6,12,0.85)',
+                          border: '1px solid rgba(255,255,255,0.08)',
+                          borderRadius: '8px',
+                          padding: '8px 10px',
+                          color: '#e0f0ff',
+                          fontSize: '0.74rem',
+                          outline: 'none',
+                        }}
+                      >
+                        <option value="ollama">Ollama (Local)</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="gemini">Gemini</option>
+                        <option value="anthropic">Anthropic (Claude)</option>
+                      </select>
+                      {aiProvider === 'ollama' ? (
+                        <>
+                          <input
+                            value={ollamaBaseUrl}
+                            onChange={(event) => setOllamaBaseUrl(event.target.value)}
+                            placeholder={DEFAULT_OLLAMA_BASE_URL}
+                            style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.74rem', outline: 'none' }}
+                          />
+                          <input
+                            value={ollamaModel}
+                            onChange={(event) => setOllamaModel(event.target.value)}
+                            placeholder={DEFAULT_OLLAMA_MODEL}
+                            style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.74rem', outline: 'none' }}
+                          />
+                        </>
+                      ) : (
+                        <>
+                          <input
+                            value={cloudModel}
+                            onChange={(event) => setCloudModel(event.target.value)}
+                            placeholder={aiProvider === 'openai' ? DEFAULT_OPENAI_MODEL : aiProvider === 'gemini' ? DEFAULT_GEMINI_MODEL : DEFAULT_ANTHROPIC_MODEL}
+                            style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.74rem', outline: 'none' }}
+                          />
+                          <input
+                            type="password"
+                            value={aiProvider === 'openai' ? openaiApiKey : aiProvider === 'gemini' ? geminiApiKey : anthropicApiKey}
+                            onChange={(event) => {
+                              if (aiProvider === 'openai') setOpenaiApiKey(event.target.value);
+                              else if (aiProvider === 'gemini') setGeminiApiKey(event.target.value);
+                              else setAnthropicApiKey(event.target.value);
+                            }}
+                            placeholder={`${activeProviderLabel} API key`}
+                            style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.74rem', outline: 'none' }}
+                          />
+                          <div style={{ fontSize: '0.7rem', color: '#7f96b2' }}>
+                            Keys are stored only in this browser's local storage for this app.
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
                   <div style={cardStyle}>
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
                       <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Node Filters</div>
@@ -2909,7 +3069,7 @@ const NeuralExplorer3D: React.FC = () => {
                       }}
                     >
                       <div style={{ fontSize: '0.72rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc' }}>
-                        Local Ollama Reviewer
+                        AI Reviewer ({activeProviderLabel})
                       </div>
                       {ollamaCorsHint && (
                         <div
@@ -2926,38 +3086,40 @@ const NeuralExplorer3D: React.FC = () => {
                           Hosted Webula can only reach a local Ollama server if Ollama allows this site origin. {ollamaCorsHint}
                         </div>
                       )}
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-                        <input
-                          value={ollamaBaseUrl}
-                          onChange={(event) => setOllamaBaseUrl(event.target.value)}
-                          placeholder={DEFAULT_OLLAMA_BASE_URL}
-                          style={{
-                            width: '100%',
-                            background: 'rgba(4, 6, 12, 0.85)',
-                            border: '1px solid rgba(255, 255, 255, 0.08)',
-                            borderRadius: '8px',
-                            padding: '8px 10px',
-                            color: '#e0f0ff',
-                            fontSize: '0.74rem',
-                            outline: 'none',
-                          }}
-                        />
-                        <input
-                          value={ollamaModel}
-                          onChange={(event) => setOllamaModel(event.target.value)}
-                          placeholder={DEFAULT_OLLAMA_MODEL}
-                          style={{
-                            width: '100%',
-                            background: 'rgba(4, 6, 12, 0.85)',
-                            border: '1px solid rgba(255, 255, 255, 0.08)',
-                            borderRadius: '8px',
-                            padding: '8px 10px',
-                            color: '#e0f0ff',
-                            fontSize: '0.74rem',
-                            outline: 'none',
-                          }}
-                        />
-                      </div>
+                      {aiProvider === 'ollama' && (
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                          <input
+                            value={ollamaBaseUrl}
+                            onChange={(event) => setOllamaBaseUrl(event.target.value)}
+                            placeholder={DEFAULT_OLLAMA_BASE_URL}
+                            style={{
+                              width: '100%',
+                              background: 'rgba(4, 6, 12, 0.85)',
+                              border: '1px solid rgba(255, 255, 255, 0.08)',
+                              borderRadius: '8px',
+                              padding: '8px 10px',
+                              color: '#e0f0ff',
+                              fontSize: '0.74rem',
+                              outline: 'none',
+                            }}
+                          />
+                          <input
+                            value={ollamaModel}
+                            onChange={(event) => setOllamaModel(event.target.value)}
+                            placeholder={DEFAULT_OLLAMA_MODEL}
+                            style={{
+                              width: '100%',
+                              background: 'rgba(4, 6, 12, 0.85)',
+                              border: '1px solid rgba(255, 255, 255, 0.08)',
+                              borderRadius: '8px',
+                              padding: '8px 10px',
+                              color: '#e0f0ff',
+                              fontSize: '0.74rem',
+                              outline: 'none',
+                            }}
+                          />
+                        </div>
+                      )}
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                         <button
                           style={accentButtonStyle}
@@ -3011,10 +3173,10 @@ const NeuralExplorer3D: React.FC = () => {
                       }}
                     >
                       <div style={{ fontSize: '0.72rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc' }}>
-                        Coding Chat (Ollama)
+                        Coding Chat ({activeProviderLabel})
                       </div>
                       <div style={{ fontSize: '0.72rem', color: '#7f96b2' }}>
-                        Model: {ollamaModel || DEFAULT_OLLAMA_MODEL}
+                        Model: {activeProviderModel}
                       </div>
                       <div
                         style={{
