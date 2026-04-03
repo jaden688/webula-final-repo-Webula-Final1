@@ -260,7 +260,10 @@ const LAYOUT_STORAGE_KEY = 'neural-nexus-layout-v1';
 const AI_PROVIDER_STORAGE_KEY = 'neural-nexus-ai-provider-v1';
 const OLLAMA_BASE_URL_STORAGE_KEY = 'neural-nexus-ollama-base-url-v1';
 const OLLAMA_MODEL_STORAGE_KEY = 'neural-nexus-ollama-model-v1';
-const CLOUD_MODEL_STORAGE_KEY = 'neural-nexus-cloud-model-v1';
+const LEGACY_CLOUD_MODEL_STORAGE_KEY = 'neural-nexus-cloud-model-v1';
+const OPENAI_MODEL_STORAGE_KEY = 'neural-nexus-openai-model-v1';
+const GEMINI_MODEL_STORAGE_KEY = 'neural-nexus-gemini-model-v1';
+const ANTHROPIC_MODEL_STORAGE_KEY = 'neural-nexus-anthropic-model-v1';
 const OPENAI_KEY_STORAGE_KEY = 'neural-nexus-openai-key-v1';
 const GEMINI_KEY_STORAGE_KEY = 'neural-nexus-gemini-key-v1';
 const ANTHROPIC_KEY_STORAGE_KEY = 'neural-nexus-anthropic-key-v1';
@@ -458,8 +461,14 @@ const NeuralExplorer3D: React.FC = () => {
   const [ollamaModel, setOllamaModel] = useState<string>(() => (
     loadStoredText(OLLAMA_MODEL_STORAGE_KEY, DEFAULT_OLLAMA_MODEL)
   ));
-  const [cloudModel, setCloudModel] = useState<string>(() => (
-    loadStoredText(CLOUD_MODEL_STORAGE_KEY, DEFAULT_OPENAI_MODEL)
+  const [openaiModel, setOpenaiModel] = useState<string>(() => (
+    loadStoredText(OPENAI_MODEL_STORAGE_KEY, loadStoredText(LEGACY_CLOUD_MODEL_STORAGE_KEY, DEFAULT_OPENAI_MODEL))
+  ));
+  const [geminiModel, setGeminiModel] = useState<string>(() => (
+    loadStoredText(GEMINI_MODEL_STORAGE_KEY, DEFAULT_GEMINI_MODEL)
+  ));
+  const [anthropicModel, setAnthropicModel] = useState<string>(() => (
+    loadStoredText(ANTHROPIC_MODEL_STORAGE_KEY, DEFAULT_ANTHROPIC_MODEL)
   ));
   const [openaiApiKey, setOpenaiApiKey] = useState<string>(() => (
     loadStoredText(OPENAI_KEY_STORAGE_KEY, '')
@@ -521,12 +530,14 @@ const NeuralExplorer3D: React.FC = () => {
     if (aiProvider === 'ollama') {
       return (ollamaModel || DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL;
     }
-    const explicit = (cloudModel || '').trim();
-    if (explicit) return explicit;
-    if (aiProvider === 'openai') return DEFAULT_OPENAI_MODEL;
-    if (aiProvider === 'gemini') return DEFAULT_GEMINI_MODEL;
-    return DEFAULT_ANTHROPIC_MODEL;
-  }, [aiProvider, cloudModel, ollamaModel]);
+    if (aiProvider === 'openai') {
+      return (openaiModel || DEFAULT_OPENAI_MODEL).trim() || DEFAULT_OPENAI_MODEL;
+    }
+    if (aiProvider === 'gemini') {
+      return (geminiModel || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
+    }
+    return (anthropicModel || DEFAULT_ANTHROPIC_MODEL).trim() || DEFAULT_ANTHROPIC_MODEL;
+  }, [aiProvider, anthropicModel, geminiModel, ollamaModel, openaiModel]);
   const activeProviderApiKey = useMemo(() => {
     if (aiProvider === 'openai') return openaiApiKey;
     if (aiProvider === 'gemini') return geminiApiKey;
@@ -597,11 +608,13 @@ const NeuralExplorer3D: React.FC = () => {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
-      window.localStorage.setItem(CLOUD_MODEL_STORAGE_KEY, cloudModel);
+      window.localStorage.setItem(OPENAI_MODEL_STORAGE_KEY, openaiModel);
+      window.localStorage.setItem(GEMINI_MODEL_STORAGE_KEY, geminiModel);
+      window.localStorage.setItem(ANTHROPIC_MODEL_STORAGE_KEY, anthropicModel);
     } catch (error) {
-      console.warn('Failed to persist cloud model', error);
+      console.warn('Failed to persist provider models', error);
     }
-  }, [cloudModel]);
+  }, [anthropicModel, geminiModel, openaiModel]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -2766,8 +2779,12 @@ const NeuralExplorer3D: React.FC = () => {
                       ) : (
                         <>
                           <input
-                            value={cloudModel}
-                            onChange={(event) => setCloudModel(event.target.value)}
+                            value={aiProvider === 'openai' ? openaiModel : aiProvider === 'gemini' ? geminiModel : anthropicModel}
+                            onChange={(event) => {
+                              if (aiProvider === 'openai') setOpenaiModel(event.target.value);
+                              else if (aiProvider === 'gemini') setGeminiModel(event.target.value);
+                              else setAnthropicModel(event.target.value);
+                            }}
                             placeholder={aiProvider === 'openai' ? DEFAULT_OPENAI_MODEL : aiProvider === 'gemini' ? DEFAULT_GEMINI_MODEL : DEFAULT_ANTHROPIC_MODEL}
                             style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.74rem', outline: 'none' }}
                           />
