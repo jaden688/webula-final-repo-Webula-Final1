@@ -46,6 +46,8 @@ type ChatMessage = {
   content: string;
 };
 
+type RightDockTab = 'inspector' | 'editor' | 'chat' | 'review' | 'controls';
+
 interface OllamaTagsResponse {
   models?: Array<{
     name?: string;
@@ -110,6 +112,7 @@ interface Settings {
   groupExternalDeps: boolean;
   maxDependencyFiles: number;
   maxDependencyFileSizeKb: number;
+  pulseIntervalMs: number;
 }
 
 // --- Mock Data (fallback) ---
@@ -255,6 +258,9 @@ const OLLAMA_MODEL_STORAGE_KEY = 'neural-nexus-ollama-model-v1';
 const ORBIT_SPEED_MULTIPLIER = 3;
 const MAX_CHAT_HISTORY_MESSAGES = 14;
 const MAX_CHAT_CONTEXT_CHARS = 16_000;
+const CODE_FENCE_RE = /```(?:[\w+-]+)?\r?\n([\s\S]*?)```/g;
+const PANEL_MIN_WIDTH = 180;
+const PANEL_MAX_WIDTH = 720;
 
 const DEFAULT_SETTINGS: Settings = {
   maxDepth: 3,
@@ -286,6 +292,7 @@ const DEFAULT_SETTINGS: Settings = {
   groupExternalDeps: true,
   maxDependencyFiles: 400,
   maxDependencyFileSizeKb: 512,
+  pulseIntervalMs: PULSE_INTERVAL_MS,
 };
 
 type StoredLayout = {
@@ -296,7 +303,7 @@ type StoredLayout = {
 };
 
 const DEFAULT_LAYOUT: StoredLayout = {
-  leftWidth: 280,
+  leftWidth: 300,
   rightWidth: 360,
   isLeftCollapsed: false,
   isRightCollapsed: false,
@@ -322,8 +329,8 @@ const loadStoredLayout = (): StoredLayout => {
     if (!raw) return DEFAULT_LAYOUT;
     const parsed = JSON.parse(raw) as Partial<StoredLayout>;
     return {
-      leftWidth: clamp(Number(parsed.leftWidth ?? DEFAULT_LAYOUT.leftWidth), 220, 520),
-      rightWidth: clamp(Number(parsed.rightWidth ?? DEFAULT_LAYOUT.rightWidth), 220, 520),
+      leftWidth: clamp(Number(parsed.leftWidth ?? DEFAULT_LAYOUT.leftWidth), PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
+      rightWidth: clamp(Number(parsed.rightWidth ?? DEFAULT_LAYOUT.rightWidth), PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
       isLeftCollapsed: Boolean(parsed.isLeftCollapsed),
       isRightCollapsed: Boolean(parsed.isRightCollapsed),
     };
@@ -449,12 +456,20 @@ const NeuralExplorer3D: React.FC = () => {
   const [isChattingWithModel, setIsChattingWithModel] = useState(false);
   const [chatStatus, setChatStatus] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatApplyStatus, setChatApplyStatus] = useState<string | null>(null);
+  const [chatApplyError, setChatApplyError] = useState<string | null>(null);
   const initialLayout = useMemo(() => loadStoredLayout(), []);
   const [leftWidth, setLeftWidth] = useState(initialLayout.leftWidth);
   const [rightWidth, setRightWidth] = useState(initialLayout.rightWidth);
   const [isLeftCollapsed, setIsLeftCollapsed] = useState(initialLayout.isLeftCollapsed);
   const [isRightCollapsed, setIsRightCollapsed] = useState(initialLayout.isRightCollapsed);
   const [isEditorModalVisible, setIsEditorModalVisible] = useState(false);
+  const [rightDockTab, setRightDockTab] = useState<RightDockTab>('inspector');
+  const dockEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const dockEditorLinesRef = useRef<HTMLPreElement | null>(null);
+  const modalEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const modalEditorLinesRef = useRef<HTMLPreElement | null>(null);
+  const [editorCursor, setEditorCursor] = useState({ line: 1, column: 1 });
   const [viewport, setViewport] = useState({ width: window.innerWidth, height: window.innerHeight });
   const [graphRefVersion, setGraphRefVersion] = useState(0);
 
@@ -896,6 +911,37 @@ const NeuralExplorer3D: React.FC = () => {
     setEditorError(null);
   }, []);
 
+  const editorLineNumbers = useMemo(() => {
+    const lineCount = Math.max(1, (editorContent ?? '').split(/\r?\n/).length);
+    return Array.from({ length: lineCount }, (_, index) => String(index + 1)).join('\n');
+  }, [editorContent]);
+
+  const getCursorLineColumn = useCallback((text: string, index: number) => {
+    const safeIndex = Math.max(0, Math.min(index, text.length));
+    const before = text.slice(0, safeIndex);
+    const segments = before.split(/\r?\n/);
+    const line = segments.length;
+    const column = (segments[segments.length - 1]?.length ?? 0) + 1;
+    return { line, column };
+  }, []);
+
+  const handleEditorCursorUpdate = useCallback((selectionStart: number) => {
+    const content = editorContent ?? '';
+    setEditorCursor(getCursorLineColumn(content, selectionStart));
+  }, [editorContent, getCursorLineColumn]);
+
+  const syncEditorLineScroll = useCallback((origin: 'dock' | 'modal') => {
+    if (origin === 'dock') {
+      if (dockEditorLinesRef.current && dockEditorRef.current) {
+        dockEditorLinesRef.current.scrollTop = dockEditorRef.current.scrollTop;
+      }
+      return;
+    }
+    if (modalEditorLinesRef.current && modalEditorRef.current) {
+      modalEditorLinesRef.current.scrollTop = modalEditorRef.current.scrollTop;
+    }
+  }, []);
+
   const handleEditorSave = useCallback(async () => {
     if (!selectedNode || !selectedNode.handle || editorContent === null) return;
     setEditorStatus('Saving...');
@@ -972,6 +1018,55 @@ const NeuralExplorer3D: React.FC = () => {
     }
   }, [editorContent, ollamaBaseUrl, ollamaModel, selectedNode]);
 
+  const extractCodeBlockFromMessage = useCallback((content: string) => {
+    let match: RegExpExecArray | null;
+    const blocks: string[] = [];
+    CODE_FENCE_RE.lastIndex = 0;
+    while (true) {
+      match = CODE_FENCE_RE.exec(content);
+      if (!match) break;
+      blocks.push((match[1] || '').trimEnd());
+    }
+    if (!blocks.length) return null;
+    const best = blocks.reduce((longest, block) => (block.length > longest.length ? block : longest), blocks[0]);
+    return best.trim() ? best : null;
+  }, []);
+
+  const handleApplyAssistantCode = useCallback((assistantMessage: string) => {
+    if (!selectedNode || !isEditorEligibleType(selectedNode.type)) {
+      setChatApplyStatus(null);
+      setChatApplyError('Select a code/text node before applying generated code.');
+      return;
+    }
+    if (editorContent === null) {
+      setChatApplyStatus(null);
+      setChatApplyError('Editor is not ready yet.');
+      return;
+    }
+    const extractedCode = extractCodeBlockFromMessage(assistantMessage);
+    if (!extractedCode) {
+      setChatApplyStatus(null);
+      setChatApplyError('No fenced code block found in that model response.');
+      return;
+    }
+    setEditorContent(extractedCode);
+    setIsEditorDirty(true);
+    setEditorStatus('Applied model code to editor (not saved yet)');
+    setEditorError(null);
+    setChatApplyError(null);
+    setChatApplyStatus(`Applied code block to ${selectedNode.name}. Review then click Save.`);
+  }, [editorContent, extractCodeBlockFromMessage, selectedNode]);
+
+  const handleApplyLatestAssistantCode = useCallback(() => {
+    const lastAssistantMessage = [...chatMessages].reverse().find((message) => message.role === 'assistant');
+    if (!lastAssistantMessage) {
+      setChatApplyStatus(null);
+      setChatApplyError('No model response found yet.');
+      return;
+    }
+    handleApplyAssistantCode(lastAssistantMessage.content);
+  }, [chatMessages, handleApplyAssistantCode]);
+
   const handleSendCodingChat = useCallback(async () => {
     const prompt = chatInput.trim();
     if (!prompt) return;
@@ -989,6 +1084,8 @@ const NeuralExplorer3D: React.FC = () => {
     setChatMessages(nextMessages);
     setChatInput('');
     setChatError(null);
+    setChatApplyError(null);
+    setChatApplyStatus(null);
     setIsChattingWithModel(true);
     if (hasPriorUserTurn) {
       setChatStatus(`Waiting on ${ollamaModel || DEFAULT_OLLAMA_MODEL}...`);
@@ -1000,6 +1097,8 @@ const NeuralExplorer3D: React.FC = () => {
       'You are a senior coding assistant.',
       'Be practical, specific, and bug-focused.',
       'When giving code changes, explain rationale and risks briefly.',
+      'When you provide edited code, include it in fenced markdown code blocks.',
+      'If the user asks for a full-file rewrite, output the full file content in one fenced code block.',
       'Prefer concise answers unless asked for depth.',
     ].join(' ');
 
@@ -1057,6 +1156,8 @@ const NeuralExplorer3D: React.FC = () => {
     setChatMessages([]);
     setChatError(null);
     setChatStatus(null);
+    setChatApplyError(null);
+    setChatApplyStatus(null);
   }, []);
 
   useEffect(() => {
@@ -1070,7 +1171,17 @@ const NeuralExplorer3D: React.FC = () => {
     setChatInput('');
     setChatError(null);
     setChatStatus(null);
+    setChatApplyError(null);
+    setChatApplyStatus(null);
   }, [selectedNode?.id]);
+
+  useEffect(() => {
+    if (editorContent === null) {
+      setEditorCursor({ line: 1, column: 1 });
+      return;
+    }
+    setEditorCursor({ line: 1, column: 1 });
+  }, [selectedNode?.id, editorContent === null]);
 
   useEffect(() => {
     if (!selectedNode) {
@@ -1115,9 +1226,9 @@ const NeuralExplorer3D: React.FC = () => {
       localIndex = (localIndex + 1) % pulseSequence.length;
       setActivePulseIndex(localIndex);
       setActivePulseId(pulseSequence[localIndex]);
-    }, PULSE_INTERVAL_MS);
+    }, settings.pulseIntervalMs);
     return () => clearInterval(interval);
-  }, [isPulseActive, pulseSequence]);
+  }, [isPulseActive, pulseSequence, settings.pulseIntervalMs]);
 
   useEffect(() => {
     if (!isPulseActive || pulseSequence.length === 0 || !activePulseId) {
@@ -1568,8 +1679,8 @@ const NeuralExplorer3D: React.FC = () => {
       if (!dragStateRef.current) return;
       const { side, startX, startWidth } = dragStateRef.current;
       const delta = event.clientX - startX;
-      const minWidth = 220;
-      const maxWidth = 520;
+      const minWidth = PANEL_MIN_WIDTH;
+      const maxWidth = PANEL_MAX_WIDTH;
 
       if (side === 'left') {
         const next = clamp(startWidth + delta, minWidth, maxWidth);
@@ -1781,11 +1892,11 @@ const NeuralExplorer3D: React.FC = () => {
     );
   };
 
-  const isCompactTopBar = viewport.width < 1550;
-  const topBarHeight = isCompactTopBar ? 124 : 56;
+  const isCompactTopBar = viewport.width < 1700;
+  const topBarHeight = isCompactTopBar ? 112 : 58;
   const panelTop = topBarHeight + 12;
-  const panelBottom = 16;
-  const collapsedWidth = 52;
+  const panelBottom = 20;
+  const collapsedWidth = 42;
   const activeOllamaModel = (ollamaModel || DEFAULT_OLLAMA_MODEL).trim() || DEFAULT_OLLAMA_MODEL;
   const topBarModelLabel = activeOllamaModel.length > 24
     ? `${activeOllamaModel.slice(0, 21)}...`
@@ -1814,25 +1925,25 @@ const NeuralExplorer3D: React.FC = () => {
   };
 
   const sectionTitleStyle: React.CSSProperties = {
-    fontSize: '0.72rem',
+    fontSize: '0.78rem',
     letterSpacing: '0.12em',
     textTransform: 'uppercase',
     color: '#7f96b2',
-    marginBottom: '8px',
+    marginBottom: '10px',
   };
 
   const panelShellStyle: React.CSSProperties = {
-    background: 'rgba(8, 12, 20, 0.82)',
-    borderRadius: '14px',
-    boxShadow: '0 14px 30px rgba(0, 0, 0, 0.35)',
-    border: '1px solid rgba(255, 255, 255, 0.05)',
-    backdropFilter: 'blur(12px)',
+    background: 'rgba(7, 11, 20, 0.58)',
+    borderRadius: '10px',
+    boxShadow: '0 8px 20px rgba(0, 0, 0, 0.22)',
+    border: '1px solid rgba(120, 180, 255, 0.12)',
+    backdropFilter: 'blur(8px)',
   };
 
   const cardStyle: React.CSSProperties = {
     background: 'rgba(12, 16, 28, 0.8)',
     borderRadius: '12px',
-    padding: '12px',
+    padding: '14px',
     border: '1px solid rgba(255, 255, 255, 0.06)',
   };
 
@@ -1840,10 +1951,10 @@ const NeuralExplorer3D: React.FC = () => {
     background: 'rgba(255, 255, 255, 0.06)',
     border: '1px solid rgba(255, 255, 255, 0.08)',
     color: '#e6f6ff',
-    padding: '8px 10px',
+    padding: '9px 12px',
     cursor: 'pointer',
     fontFamily: 'Segoe UI, Arial, sans-serif',
-    fontSize: '0.75rem',
+    fontSize: '0.8rem',
     borderRadius: '8px',
     transition: 'all 0.2s',
   };
@@ -1855,6 +1966,21 @@ const NeuralExplorer3D: React.FC = () => {
     color: '#d9feff',
   };
 
+  const rightTabButtonStyle = (tab: RightDockTab): React.CSSProperties => ({
+    ...buttonStyle,
+    flex: 1,
+    padding: '7px 8px',
+    fontSize: '0.74rem',
+    borderRadius: '7px',
+    border: tab === rightDockTab
+      ? '1px solid rgba(125, 220, 255, 0.55)'
+      : '1px solid rgba(255, 255, 255, 0.07)',
+    background: tab === rightDockTab
+      ? 'linear-gradient(135deg, rgba(85, 180, 255, 0.33), rgba(40, 100, 220, 0.14))'
+      : 'rgba(255, 255, 255, 0.05)',
+    color: tab === rightDockTab ? '#dff7ff' : '#b8d6ee',
+  });
+
   return (
     <div
       style={{
@@ -1864,6 +1990,8 @@ const NeuralExplorer3D: React.FC = () => {
         overflow: 'hidden',
         color: '#eef6ff',
         fontFamily: 'Segoe UI, Arial, sans-serif',
+        fontSize: '15px',
+        lineHeight: 1.5,
       }}
     >
       {/* Top Command Bar */}
@@ -2067,12 +2195,12 @@ const NeuralExplorer3D: React.FC = () => {
           position: 'absolute',
           top: `${panelTop}px`,
           bottom: `${panelBottom}px`,
-          left: '16px',
+          left: '8px',
           width: `${leftPanelWidth}px`,
-          padding: isLeftCollapsed ? '10px' : '16px',
+          padding: isLeftCollapsed ? '12px' : '18px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '10px',
+          gap: '12px',
           zIndex: 20,
           ...panelShellStyle,
         }}
@@ -2155,392 +2283,261 @@ const NeuralExplorer3D: React.FC = () => {
           style={{
             position: 'absolute',
             top: 0,
-            right: -6,
-            width: 12,
+            right: -5,
+            width: 10,
             bottom: 0,
             cursor: 'col-resize',
+            zIndex: 35,
+            opacity: isLeftCollapsed ? 0.7 : 0.35,
+            background: 'linear-gradient(270deg, rgba(110, 210, 255, 0.35), rgba(110, 210, 255, 0))',
           }}
         />
       </div>
 
-      {/* Inspector + Settings */}
+      {/* IDE Right Dock */}
       <div
         style={{
           position: 'absolute',
           top: `${panelTop}px`,
           bottom: `${panelBottom}px`,
-          right: '16px',
+          right: '8px',
           width: `${rightPanelWidth}px`,
-          padding: isRightCollapsed ? '10px' : '16px',
+          padding: isRightCollapsed ? '10px' : '12px',
           display: 'flex',
           flexDirection: 'column',
-          gap: '12px',
+          gap: '10px',
           zIndex: 20,
-          overflowY: 'auto',
+          overflow: 'hidden',
           ...panelShellStyle,
         }}
       >
         {isRightCollapsed ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', alignItems: 'center' }}>
             <div style={{ fontSize: '0.7rem', color: '#7f96b2', writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}>
-              Inspector
+              Dock
             </div>
             <button style={buttonStyle} onClick={() => setIsRightCollapsed(false)}>&lt;</button>
           </div>
         ) : (
           <>
-            <div style={sectionTitleStyle}>Inspector</div>
-            <div style={cardStyle}>
-              {selectedNode ? (
+            <div style={{ ...sectionTitleStyle, marginBottom: '0px' }}>Right Dock</div>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button style={rightTabButtonStyle('inspector')} onClick={() => setRightDockTab('inspector')}>Inspector</button>
+              <button style={rightTabButtonStyle('editor')} onClick={() => setRightDockTab('editor')}>Editor</button>
+              <button style={rightTabButtonStyle('chat')} onClick={() => setRightDockTab('chat')}>Chat</button>
+              <button style={rightTabButtonStyle('review')} onClick={() => setRightDockTab('review')}>Review</button>
+              <button style={rightTabButtonStyle('controls')} onClick={() => setRightDockTab('controls')}>Controls</button>
+            </div>
+
+            <div
+              style={{
+                flex: 1,
+                overflowY: 'auto',
+                paddingRight: '4px',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '10px',
+              }}
+            >
+              {rightDockTab === 'inspector' && (
                 <>
-                  <div style={{ fontSize: '1rem', fontWeight: 600 }}>{selectedNode.name}</div>
-                  <div style={{ fontSize: '0.72rem', color: '#8ea2bf', marginTop: '4px' }}>
-                    Type: {selectedNode.type.toUpperCase()}
-                  </div>
-                  {selectedNode.path && (
-                    <div style={{ fontSize: '0.7rem', color: '#6f86a3', marginTop: '4px' }}>
-                      Path: {selectedNode.path}
-                    </div>
-                  )}
-                  {selectedNode.sizeBytes !== undefined && (
-                    <div style={{ fontSize: '0.72rem', color: '#9eb2cc', marginTop: '4px' }}>
-                      Size: {formatBytes(selectedNode.sizeBytes)}
-                    </div>
-                  )}
-                  <div style={{ marginTop: '12px' }}>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7, marginBottom: '6px' }}>Preview</div>
-                    {isPreviewLoading && (
-                      <div style={{ fontSize: '0.75rem', opacity: 0.7 }}>Loading preview...</div>
-                    )}
-                    {!isPreviewLoading && previewError && (
-                      <div style={{ fontSize: '0.75rem', opacity: 0.7 }}>{previewError}</div>
-                    )}
-                    {!isPreviewLoading && previewUrl && (
-                      <img
-                        src={previewUrl}
-                        alt={selectedNode.name}
-                        style={{
-                          width: '100%',
-                          borderRadius: '10px',
-                          border: '1px solid rgba(255, 255, 255, 0.1)',
-                          maxHeight: '240px',
-                          objectFit: 'cover',
-                        }}
-                      />
-                    )}
-                    {!isPreviewLoading && !previewUrl && previewText && (
-                      <pre
-                        style={{
-                          whiteSpace: 'pre-wrap',
-                          background: 'rgba(0, 0, 0, 0.45)',
-                          border: '1px solid rgba(255, 255, 255, 0.08)',
-                          borderRadius: '10px',
-                          padding: '10px',
-                          fontSize: '0.72rem',
-                          maxHeight: '200px',
-                          overflowY: 'auto',
-                          color: '#dbe7ff',
-                        }}
-                      >
-                        {previewText}
-                      </pre>
-                    )}
-                {!isPreviewLoading && !previewError && !previewUrl && !previewText && (
-                  <div style={{ fontSize: '0.7rem', opacity: 0.6 }}>Preview unavailable.</div>
-                )}
-              </div>
-              {selectedAnalysis && (
-                <div
-                  style={{
-                    marginTop: '14px',
-                    padding: '10px',
-                    borderRadius: '10px',
-                    border: '1px solid rgba(255, 255, 255, 0.08)',
-                    background: 'rgba(6, 8, 14, 0.6)',
-                  }}
-                >
-                  <div style={{ fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc', marginBottom: '8px' }}>
-                    Parsed Structure
-                  </div>
-                  <div style={{ fontSize: '0.7rem', color: '#c6d9f3', lineHeight: 1.5 }}>
-                    <div>
-                      Kind: {selectedAnalysis.kind}
-                      {selectedAnalysis.language ? ` | Language: ${selectedAnalysis.language}` : ''}
-                    </div>
-                    <div>
-                      Lines: {selectedAnalysis.lineCount} | Chars: {selectedAnalysis.charCount.toLocaleString()} | Imports: {selectedAnalysis.imports.length} | Exports: {selectedAnalysis.exports.length}
-                    </div>
-                    {selectedAnalysis.packageSummary && (
-                      <div style={{ marginTop: '6px' }}>
-                        Package: {selectedAnalysis.packageSummary.name ?? selectedNode?.name ?? 'Unknown'}
-                        {selectedAnalysis.packageSummary.version ? ` @ ${selectedAnalysis.packageSummary.version}` : ''}
-                        {' | '}
-                        Deps: {selectedAnalysis.packageSummary.dependencyCount}
-                        {' / '}
-                        Dev: {selectedAnalysis.packageSummary.devDependencyCount}
-                      </div>
-                    )}
-                    {selectedAnalysis.entryPoints.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Entrypoints: {selectedAnalysis.entryPoints.slice(0, 4).join(', ')}
-                        {selectedAnalysis.entryPoints.length > 4 ? '...' : ''}
-                      </div>
-                    )}
-                    {selectedAnalysis.symbols.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Symbols: {selectedAnalysis.symbols.slice(0, 8).join(', ')}
-                        {selectedAnalysis.symbols.length > 8 ? '...' : ''}
-                      </div>
-                    )}
-                    {selectedAnalysis.headings.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Headings: {selectedAnalysis.headings.slice(0, 6).join(' | ')}
-                        {selectedAnalysis.headings.length > 6 ? '...' : ''}
-                      </div>
-                    )}
-                    {selectedAnalysis.configKeys.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Config keys: {selectedAnalysis.configKeys.slice(0, 8).join(', ')}
-                        {selectedAnalysis.configKeys.length > 8 ? '...' : ''}
-                      </div>
-                    )}
-                    {selectedAnalysis.frameworkHints.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Hints: {selectedAnalysis.frameworkHints.join(', ')}
-                      </div>
-                    )}
-                    {selectedAnalysis.notes.length > 0 && (
-                      <div style={{ marginTop: '6px', color: '#9db3d3' }}>
-                        {selectedAnalysis.notes.join(' ')}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-              {selectedNode && isEditorEligibleType(selectedNode.type) && !isEditorModalVisible && (
-                <div style={{ marginTop: '14px' }}>
-                  <div style={{ fontSize: '0.7rem', opacity: 0.7, marginBottom: '6px' }}>
-                    Code Editor
-                  </div>
-                  {editorContent !== null ? (
-                    <>
-                      <textarea
-                        value={editorContent}
-                        onChange={(e) => handleEditorChange(e.target.value)}
-                        disabled={isEditorLoading}
-                        style={{
-                          width: '100%',
-                          minHeight: '160px',
-                          borderRadius: '10px',
-                          border: '1px solid rgba(255, 255, 255, 0.08)',
-                          background: 'rgba(4, 6, 12, 0.85)',
-                          color: '#e0f0ff',
-                          padding: '10px',
-                          fontSize: '0.72rem',
-                          fontFamily: 'Consolas, "SFMono-Regular", "Segoe UI", monospace',
-                          resize: 'vertical',
-                          lineHeight: 1.4,
-                        }}
-                      />
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px', gap: '8px' }}>
-                        <div style={{ fontSize: '0.7rem', color: '#7f96b2' }}>
-                          {isEditorLoading
-                            ? 'Loading editor...'
-                            : isEditorDirty
-                              ? 'Unsaved changes'
-                              : 'In sync'}
-                          {editorStatus ? ` | ${editorStatus}` : ''}
+                  <div style={cardStyle}>
+                    {selectedNode ? (
+                      <>
+                        <div style={{ fontSize: '0.95rem', fontWeight: 600 }}>{selectedNode.name}</div>
+                        <div style={{ fontSize: '0.72rem', color: '#8ea2bf', marginTop: '4px' }}>
+                          {selectedNode.type.toUpperCase()}
+                          {selectedNode.sizeBytes !== undefined ? ` | ${formatBytes(selectedNode.sizeBytes)}` : ''}
                         </div>
-                        <div style={{ display: 'flex', gap: '6px' }}>
-                          <button
-                            style={accentButtonStyle}
-                            onClick={handleEditorSave}
-                            disabled={isEditorLoading || !isEditorDirty}
-                          >
-                            Save
-                          </button>
-                          <button
-                            style={buttonStyle}
-                            onClick={handleEditorRevert}
-                            disabled={isEditorLoading || !isEditorDirty}
-                          >
-                            Revert
-                          </button>
+                        {selectedNode.path && (
+                          <div style={{ fontSize: '0.7rem', color: '#6f86a3', marginTop: '4px' }}>
+                            {selectedNode.path}
+                          </div>
+                        )}
+
+                        <div style={{ marginTop: '10px' }}>
+                          <div style={{ fontSize: '0.72rem', color: '#9eb2cc', marginBottom: '6px' }}>Preview</div>
+                          {isPreviewLoading && <div style={{ fontSize: '0.72rem', color: '#8ea2bf' }}>Loading preview...</div>}
+                          {!isPreviewLoading && previewError && <div style={{ fontSize: '0.72rem', color: '#ff9b9b' }}>{previewError}</div>}
+                          {!isPreviewLoading && previewUrl && (
+                            <img
+                              src={previewUrl}
+                              alt={selectedNode.name}
+                              style={{ width: '100%', maxHeight: '220px', objectFit: 'cover', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.08)' }}
+                            />
+                          )}
+                          {!isPreviewLoading && !previewUrl && previewText && (
+                            <pre
+                              style={{
+                                whiteSpace: 'pre-wrap',
+                                background: 'rgba(0,0,0,0.35)',
+                                border: '1px solid rgba(255,255,255,0.08)',
+                                borderRadius: '8px',
+                                padding: '8px',
+                                fontSize: '0.72rem',
+                                maxHeight: '180px',
+                                overflowY: 'auto',
+                                color: '#dbe7ff',
+                              }}
+                            >
+                              {previewText}
+                            </pre>
+                          )}
                         </div>
+                      </>
+                    ) : (
+                      <div style={{ fontSize: '0.75rem', color: '#7b8ea8' }}>
+                        Select a node in the graph or explorer.
                       </div>
-                      {editorError && (
-                        <div style={{ fontSize: '0.7rem', color: '#ff7a7a', marginTop: '6px' }}>
-                          {editorError}
-                        </div>
-                      )}
-                    </>
-                  ) : (
-                    <div style={{ fontSize: '0.72rem', color: '#9eb2cc' }}>
-                      {isEditorLoading ? 'Loading editor...' : (previewError || 'Code editor unavailable for this node.')}
-                    </div>
-                  )}
-                </div>
-              )}
-              {selectedNode && isEditorEligibleType(selectedNode.type) && (
-                <div
-                  style={{
-                    marginTop: '14px',
-                    padding: '10px',
-                    borderRadius: '10px',
-                    border: '1px solid rgba(255, 255, 255, 0.08)',
-                    background: 'rgba(6, 8, 14, 0.6)',
-                  }}
-                >
-                  <div style={{ fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc', marginBottom: '8px' }}>
-                    Local Ollama Reviewer
+                    )}
                   </div>
-                  {ollamaCorsHint && (
-                    <div
-                      style={{
-                        marginBottom: '8px',
-                        padding: '8px 10px',
-                        borderRadius: '8px',
-                        border: '1px solid rgba(255, 180, 80, 0.25)',
-                        background: 'rgba(120, 70, 0, 0.14)',
-                        color: '#ffd8a6',
-                        fontSize: '0.66rem',
-                        lineHeight: 1.45,
-                      }}
-                    >
-                      Hosted Webula can only reach a local Ollama server if Ollama allows this site origin. {ollamaCorsHint}
-                    </div>
-                  )}
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <div>
-                      <div style={{ fontSize: '0.68rem', color: '#7f96b2', marginBottom: '4px' }}>Base URL</div>
-                      <input
-                        value={ollamaBaseUrl}
-                        onChange={(event) => setOllamaBaseUrl(event.target.value)}
-                        placeholder={DEFAULT_OLLAMA_BASE_URL}
-                        style={{
-                          width: '100%',
-                          background: 'rgba(4, 6, 12, 0.85)',
-                          border: '1px solid rgba(255, 255, 255, 0.08)',
-                          borderRadius: '8px',
-                          padding: '8px 10px',
-                          color: '#e0f0ff',
-                          fontSize: '0.72rem',
-                          outline: 'none',
-                        }}
-                      />
-                    </div>
-                    <div>
-                      <div style={{ fontSize: '0.68rem', color: '#7f96b2', marginBottom: '4px' }}>Model</div>
-                      <input
-                        value={ollamaModel}
-                        onChange={(event) => setOllamaModel(event.target.value)}
-                        placeholder={DEFAULT_OLLAMA_MODEL}
-                        style={{
-                          width: '100%',
-                          background: 'rgba(4, 6, 12, 0.85)',
-                          border: '1px solid rgba(255, 255, 255, 0.08)',
-                          borderRadius: '8px',
-                          padding: '8px 10px',
-                          color: '#e0f0ff',
-                          fontSize: '0.72rem',
-                          outline: 'none',
-                        }}
-                      />
-                    </div>
-                    <div style={{ display: 'flex', gap: '8px' }}>
+
+                  <div style={cardStyle}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Dependencies</div>
                       <button
-                        style={accentButtonStyle}
-                        onClick={handleRunOllamaReview}
-                        disabled={isReviewingCode || !editorContent || !editorContent.trim()}
+                        onClick={() => parseDependencies()}
+                        style={{ ...buttonStyle, padding: '4px 8px', fontSize: '0.7rem', opacity: isParsingDeps ? 0.65 : 1 }}
+                        disabled={isParsingDeps}
                       >
-                        {isReviewingCode ? 'Reviewing...' : 'Review Current File'}
+                        {isParsingDeps ? 'Parsing...' : 'Parse'}
                       </button>
                     </div>
-                    <div style={{ fontSize: '0.68rem', color: '#7f96b2' }}>
-                      Reviews the current editor buffer (up to {Math.floor(MAX_OLLAMA_REVIEW_CHARS / 1000)}k characters).
+                    {nodeDeps ? (
+                      <div style={{ fontSize: '0.72rem', color: '#9eb2cc', lineHeight: 1.45 }}>
+                        <div>Internal: {nodeDeps.internal.length}</div>
+                        <div>External: {nodeDeps.external.length}</div>
+                        <div>Unresolved: {nodeDeps.unresolved.length}</div>
+                        <div>Incoming: {nodeDependents.length}</div>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: '0.72rem', color: '#7b8ea8' }}>Run Parse to analyze imports.</div>
+                    )}
+                    <div style={{ display: 'flex', gap: '6px', marginTop: '8px' }}>
+                      <button style={buttonStyle} disabled={!selectedNode} onClick={isIsolationActive ? resetIsolation : isolateSelection}>
+                        {isIsolationActive ? 'Exit isolation' : 'Show connected'}
+                      </button>
                     </div>
-                    {reviewStatus && (
-                      <div style={{ fontSize: '0.68rem', color: '#9db3d3' }}>
-                        {reviewStatus}
-                      </div>
-                    )}
-                    {reviewError && (
-                      <div style={{ fontSize: '0.7rem', color: '#ff7a7a' }}>
-                        {reviewError}
-                      </div>
-                    )}
-                    {reviewResult && (
-                      <pre
-                        style={{
-                          whiteSpace: 'pre-wrap',
-                          background: 'rgba(0, 0, 0, 0.45)',
-                          border: '1px solid rgba(255, 255, 255, 0.08)',
-                          borderRadius: '10px',
-                          padding: '10px',
-                          fontSize: '0.72rem',
-                          maxHeight: '260px',
-                          overflowY: 'auto',
-                          color: '#dbe7ff',
-                          lineHeight: 1.45,
-                        }}
-                      >
-                        {reviewResult}
-                      </pre>
-                    )}
                   </div>
+                </>
+              )}
+
+              {rightDockTab === 'editor' && (
+                <div style={cardStyle}>
+                  <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>Code Editor</div>
+                  {selectedNode && isEditorEligibleType(selectedNode.type) ? (
+                    editorContent !== null ? (
+                      <>
+                        <div
+                          style={{
+                            display: 'grid',
+                            gridTemplateColumns: '52px 1fr',
+                            minHeight: '360px',
+                            borderRadius: '8px',
+                            border: '1px solid rgba(255,255,255,0.1)',
+                            background: 'rgba(4, 6, 12, 0.9)',
+                            overflow: 'hidden',
+                          }}
+                        >
+                          <pre
+                            ref={dockEditorLinesRef}
+                            style={{
+                              margin: 0,
+                              padding: '10px 6px 10px 0',
+                              textAlign: 'right',
+                              fontSize: '0.72rem',
+                              color: '#6f86a3',
+                              fontFamily: 'Consolas, "SFMono-Regular", "Segoe UI", monospace',
+                              lineHeight: 1.45,
+                              userSelect: 'none',
+                              overflow: 'hidden',
+                              borderRight: '1px solid rgba(255,255,255,0.08)',
+                              background: 'rgba(20, 28, 44, 0.55)',
+                            }}
+                          >
+                            {editorLineNumbers}
+                          </pre>
+                          <textarea
+                            ref={dockEditorRef}
+                            value={editorContent}
+                            onChange={(e) => handleEditorChange(e.target.value)}
+                            onScroll={() => syncEditorLineScroll('dock')}
+                            onSelect={(e) => handleEditorCursorUpdate((e.target as HTMLTextAreaElement).selectionStart)}
+                            onKeyUp={(e) => handleEditorCursorUpdate((e.target as HTMLTextAreaElement).selectionStart)}
+                            onClick={(e) => handleEditorCursorUpdate((e.target as HTMLTextAreaElement).selectionStart)}
+                            disabled={isEditorLoading}
+                            spellCheck={false}
+                            wrap="off"
+                            style={{
+                              width: '100%',
+                              minHeight: '360px',
+                              border: 'none',
+                              background: 'transparent',
+                              color: '#e0f0ff',
+                              padding: '10px',
+                              fontSize: '0.76rem',
+                              fontFamily: 'Consolas, "SFMono-Regular", "Segoe UI", monospace',
+                              resize: 'vertical',
+                              lineHeight: 1.45,
+                              outline: 'none',
+                            }}
+                          />
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', marginTop: '8px', alignItems: 'center' }}>
+                          <div style={{ fontSize: '0.72rem', color: '#7f96b2' }}>
+                            {isEditorLoading ? 'Loading editor...' : isEditorDirty ? 'Unsaved changes' : 'In sync'}
+                            {editorStatus ? ` | ${editorStatus}` : ''}
+                            {` | Ln ${editorCursor.line}, Col ${editorCursor.column}`}
+                          </div>
+                          <div style={{ display: 'flex', gap: '6px' }}>
+                            <button style={accentButtonStyle} onClick={handleEditorSave} disabled={isEditorLoading || !isEditorDirty}>Save</button>
+                            <button style={buttonStyle} onClick={handleEditorRevert} disabled={isEditorLoading || !isEditorDirty}>Revert</button>
+                          </div>
+                        </div>
+                        {editorError && <div style={{ marginTop: '6px', fontSize: '0.72rem', color: '#ff7a7a' }}>{editorError}</div>}
+                      </>
+                    ) : (
+                      <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>{isEditorLoading ? 'Loading editor...' : 'Editor unavailable for this node.'}</div>
+                    )
+                  ) : (
+                    <div style={{ fontSize: '0.75rem', color: '#7b8ea8' }}>
+                      Select a code/text node to edit.
+                    </div>
+                  )}
                 </div>
               )}
-              {selectedNode && (
-                <div
-                  style={{
-                    marginTop: '14px',
-                    padding: '10px',
-                    borderRadius: '10px',
-                    border: '1px solid rgba(255, 255, 255, 0.08)',
-                    background: 'rgba(6, 8, 14, 0.6)',
-                  }}
-                >
-                  <div style={{ fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc', marginBottom: '8px' }}>
-                    Coding Chat (Ollama)
+
+              {rightDockTab === 'chat' && (
+                <div style={cardStyle}>
+                  <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>
+                    Coding Chat ({ollamaModel || DEFAULT_OLLAMA_MODEL})
                   </div>
-                  <div style={{ fontSize: '0.68rem', color: '#7f96b2', marginBottom: '8px' }}>
-                    Uses current model: {ollamaModel || DEFAULT_OLLAMA_MODEL}
-                  </div>
-                  <div
-                    style={{
-                      maxHeight: '220px',
-                      overflowY: 'auto',
-                      borderRadius: '8px',
-                      background: 'rgba(0, 0, 0, 0.35)',
-                      border: '1px solid rgba(255, 255, 255, 0.06)',
-                      padding: '8px',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: '6px',
-                    }}
-                  >
+                  <div style={{ maxHeight: '320px', overflowY: 'auto', borderRadius: '8px', background: 'rgba(0, 0, 0, 0.35)', border: '1px solid rgba(255,255,255,0.06)', padding: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
                     {chatMessages.length === 0 ? (
-                      <div style={{ fontSize: '0.72rem', color: '#7f96b2' }}>
-                        Ask for refactors, bug checks, architecture suggestions, or test ideas.
-                      </div>
+                      <div style={{ fontSize: '0.74rem', color: '#7f96b2' }}>Ask for refactors, bug checks, architecture suggestions, or test ideas.</div>
                     ) : (
                       chatMessages.map((message, index) => (
                         <div
                           key={`chat-${index}`}
                           style={{
-                            fontSize: '0.72rem',
+                            fontSize: '0.74rem',
                             lineHeight: 1.45,
                             color: message.role === 'assistant' ? '#dbe7ff' : '#9cdcff',
                             whiteSpace: 'pre-wrap',
                             borderRadius: '8px',
                             padding: '6px 8px',
-                            background: message.role === 'assistant'
-                              ? 'rgba(40, 70, 120, 0.18)'
-                              : 'rgba(0, 160, 255, 0.14)',
+                            background: message.role === 'assistant' ? 'rgba(40, 70, 120, 0.18)' : 'rgba(0, 160, 255, 0.14)',
                           }}
                         >
                           <strong style={{ color: '#c9f0ff' }}>{message.role === 'assistant' ? 'Model' : 'You'}:</strong>{' '}
                           {message.content}
+                          {message.role === 'assistant' && (
+                            <div style={{ marginTop: '6px' }}>
+                              <button style={buttonStyle} onClick={() => handleApplyAssistantCode(message.content)} disabled={isChattingWithModel || editorContent === null}>
+                                Apply Code To Editor
+                              </button>
+                            </div>
+                          )}
                         </div>
                       ))
                     )}
@@ -2553,490 +2550,194 @@ const NeuralExplorer3D: React.FC = () => {
                     style={{
                       width: '100%',
                       marginTop: '8px',
-                      minHeight: '78px',
+                      minHeight: '92px',
                       borderRadius: '8px',
-                      border: '1px solid rgba(255, 255, 255, 0.08)',
+                      border: '1px solid rgba(255,255,255,0.08)',
                       background: 'rgba(4, 6, 12, 0.85)',
                       color: '#e0f0ff',
                       padding: '8px 10px',
-                      fontSize: '0.72rem',
+                      fontSize: '0.74rem',
                       fontFamily: 'Consolas, "SFMono-Regular", "Segoe UI", monospace',
                       resize: 'vertical',
                       lineHeight: 1.4,
                     }}
                   />
                   <div style={{ display: 'flex', gap: '8px', marginTop: '8px', alignItems: 'center' }}>
-                    <button
-                      style={accentButtonStyle}
-                      onClick={handleSendCodingChat}
-                      disabled={isChattingWithModel || !chatInput.trim()}
-                    >
+                    <button style={accentButtonStyle} onClick={handleSendCodingChat} disabled={isChattingWithModel || !chatInput.trim()}>
                       {isChattingWithModel ? 'Thinking...' : 'Send'}
                     </button>
-                    <button
-                      style={buttonStyle}
-                      onClick={handleClearCodingChat}
-                      disabled={isChattingWithModel || chatMessages.length === 0}
-                    >
-                      Clear
+                    <button style={buttonStyle} onClick={handleClearCodingChat} disabled={isChattingWithModel || chatMessages.length === 0}>Clear</button>
+                    <button style={buttonStyle} onClick={handleApplyLatestAssistantCode} disabled={isChattingWithModel || chatMessages.length === 0 || editorContent === null}>Apply Latest Code</button>
+                  </div>
+                  {chatStatus && <div style={{ marginTop: '8px', fontSize: '0.72rem', color: '#9db3d3' }}>{chatStatus}</div>}
+                  {chatApplyStatus && <div style={{ marginTop: '8px', fontSize: '0.72rem', color: '#9ff6bf' }}>{chatApplyStatus}</div>}
+                  {chatError && <div style={{ marginTop: '8px', fontSize: '0.72rem', color: '#ff7a7a' }}>{chatError}</div>}
+                  {chatApplyError && <div style={{ marginTop: '8px', fontSize: '0.72rem', color: '#ff9b9b' }}>{chatApplyError}</div>}
+                </div>
+              )}
+
+              {rightDockTab === 'review' && (
+                <div style={cardStyle}>
+                  <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>Local Ollama Reviewer</div>
+                  {ollamaCorsHint && (
+                    <div style={{ marginBottom: '8px', padding: '8px 10px', borderRadius: '8px', border: '1px solid rgba(255,180,80,0.25)', background: 'rgba(120,70,0,0.14)', color: '#ffd8a6', fontSize: '0.68rem', lineHeight: 1.45 }}>
+                      Hosted Webula can only reach a local Ollama server if Ollama allows this site origin. {ollamaCorsHint}
+                    </div>
+                  )}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+                    <input
+                      value={ollamaBaseUrl}
+                      onChange={(event) => setOllamaBaseUrl(event.target.value)}
+                      placeholder={DEFAULT_OLLAMA_BASE_URL}
+                      style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.72rem', outline: 'none' }}
+                    />
+                    <input
+                      value={ollamaModel}
+                      onChange={(event) => setOllamaModel(event.target.value)}
+                      placeholder={DEFAULT_OLLAMA_MODEL}
+                      style={{ width: '100%', background: 'rgba(4,6,12,0.85)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: '8px', padding: '8px 10px', color: '#e0f0ff', fontSize: '0.72rem', outline: 'none' }}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px', marginTop: '8px', alignItems: 'center' }}>
+                    <button style={accentButtonStyle} onClick={handleRunOllamaReview} disabled={isReviewingCode || !editorContent || !editorContent.trim()}>
+                      {isReviewingCode ? 'Reviewing...' : 'Review Current File'}
                     </button>
+                    <div style={{ fontSize: '0.7rem', color: '#7f96b2' }}>Max {Math.floor(MAX_OLLAMA_REVIEW_CHARS / 1000)}k chars</div>
                   </div>
-                  {chatStatus && (
-                    <div style={{ marginTop: '8px', fontSize: '0.68rem', color: '#9db3d3' }}>
-                      {chatStatus}
-                    </div>
-                  )}
-                  {chatError && (
-                    <div style={{ marginTop: '8px', fontSize: '0.7rem', color: '#ff7a7a' }}>
-                      {chatError}
-                    </div>
-                  )}
-                </div>
-              )}
-              <div
-                style={{
-                  marginTop: '14px',
-                  padding: '10px',
-                  borderRadius: '10px',
-                  border: '1px solid rgba(255, 255, 255, 0.08)',
-                  background: 'rgba(6, 8, 14, 0.6)',
-                }}
-              >
-                <div style={{ fontSize: '0.75rem', letterSpacing: '0.08em', textTransform: 'uppercase', color: '#9eb2cc', marginBottom: '6px' }}>
-                  Pulse Trace
-                </div>
-                <div style={{ fontSize: '0.75rem', color: '#dbe7ff', marginBottom: '10px' }}>
-                  {pulseStatus || (!selectedNode ? 'Select a node and start pulse to trace dependencies.' : 'Ready to trace.') }
-                  {isPulseActive && activePulseId && pulseSequence.length > 0 && (
-                    <>
-                      {' '}
-                      | {`Now pulsing ${activePulseId} (${activePulseIndex + 1}/${pulseSequence.length})`}
-                    </>
+                  {reviewStatus && <div style={{ marginTop: '8px', fontSize: '0.72rem', color: '#9db3d3' }}>{reviewStatus}</div>}
+                  {reviewError && <div style={{ marginTop: '8px', fontSize: '0.72rem', color: '#ff7a7a' }}>{reviewError}</div>}
+                  {reviewResult && (
+                    <pre
+                      style={{
+                        marginTop: '8px',
+                        whiteSpace: 'pre-wrap',
+                        background: 'rgba(0,0,0,0.45)',
+                        border: '1px solid rgba(255,255,255,0.08)',
+                        borderRadius: '10px',
+                        padding: '10px',
+                        fontSize: '0.74rem',
+                        maxHeight: '360px',
+                        overflowY: 'auto',
+                        color: '#dbe7ff',
+                        lineHeight: 1.45,
+                      }}
+                    >
+                      {reviewResult}
+                    </pre>
                   )}
                 </div>
-                <div style={{ display: 'flex', gap: '8px' }}>
-                  <button
-                    style={accentButtonStyle}
-                    onClick={handleStartPulseTrace}
-                    disabled={!selectedNode || !dependencyLinks.length || isPulseActive}
-                  >
-                    Start Pulse
-                  </button>
-                  <button
-                    style={buttonStyle}
-                    onClick={handleStopPulseTrace}
-                    disabled={!isPulseActive}
-                  >
-                    Stop Pulse
-                  </button>
-                </div>
-              </div>
-              <div style={{ marginTop: '12px' }}>
-                <div style={{ fontSize: '0.7rem', opacity: 0.7, marginBottom: '6px' }}>Dependencies</div>
-                {nodeDeps ? (
-                  <div style={{ fontSize: '0.72rem', color: '#9eb2cc', lineHeight: 1.5 }}>
-                    <div>Internal: {nodeDeps.internal.length || 0}</div>
-                    <div>External: {nodeDeps.external.length || 0}</div>
-                    <div>Unresolved: {nodeDeps.unresolved.length || 0}</div>
-                    <div>Incoming: {nodeDependents.length || 0}</div>
-                    {nodeDeps.exports.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Exports: {nodeDeps.exports.join(', ')}
-                      </div>
-                    )}
-                    {nodeDeps.external.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        External: {nodeDeps.external.slice(0, 12).join(', ')}
-                        {nodeDeps.external.length > 12 ? '...' : ''}
-                      </div>
-                    )}
-                    {nodeDeps.internal.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Internal: {nodeDeps.internal.slice(0, 8).map(formatPathLabel).join(', ')}
-                        {nodeDeps.internal.length > 8 ? '...' : ''}
-                      </div>
-                    )}
-                    {nodeDeps.unresolved.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Unresolved: {nodeDeps.unresolved.slice(0, 8).join(', ')}
-                        {nodeDeps.unresolved.length > 8 ? '...' : ''}
-                      </div>
-                    )}
-                    {nodeDependents.length > 0 && (
-                      <div style={{ marginTop: '6px' }}>
-                        Used by: {nodeDependents.slice(0, 8).map(formatPathLabel).join(', ')}
-                        {nodeDependents.length > 8 ? '...' : ''}
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div style={{ fontSize: '0.72rem', color: '#7b8ea8' }}>
-                    Run Parse to analyze imports and dependencies.
-                  </div>
-                )}
-              </div>
-            </>
-          ) : (
-                <div style={{ fontSize: '0.75rem', color: '#7b8ea8' }}>
-                  Select a node in the graph or explorer to inspect details and preview its contents.
-                </div>
               )}
-            </div>
 
-            <div style={sectionTitleStyle}>View</div>
-            <div style={cardStyle}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Node Filters</div>
-                <button
-                  onClick={() => setIsFiltersOpen((prev) => !prev)}
-                  style={{ ...buttonStyle, padding: '4px 8px', fontSize: '0.7rem' }}
-                >
-                  {isFiltersOpen ? 'Hide' : 'Show'}
-                </button>
-              </div>
-              {isFiltersOpen && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 10px' }}>
-              {(['folder', 'file', 'image', 'code', 'external'] as NodeType[]).map((type) => (
-                <label key={type} style={{ fontSize: '0.75rem', opacity: visibleTypes[type] ? 1 : 0.5 }}>
-                  <input
-                    type="checkbox"
-                        checked={visibleTypes[type]}
-                        onChange={() => toggleTypeVisibility(type)}
-                        style={{ marginRight: 6 }}
-                      />
-                      {type.toUpperCase()}
-                    </label>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div style={sectionTitleStyle}>Control Deck</div>
-            <div style={cardStyle}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-                <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Simulation Tuning</div>
-                <button
-                  onClick={() => setIsSettingsOpen((prev) => !prev)}
-                  style={{ ...buttonStyle, padding: '4px 8px', fontSize: '0.7rem' }}
-                >
-                  {isSettingsOpen ? 'Hide' : 'Show'}
-                </button>
-              </div>
-              {isSettingsOpen && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                  <div style={{ fontSize: '0.68rem', color: '#7f96b2' }}>
-                    Environment settings auto-save on this device.
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Max Depth: {settings.maxDepth}</div>
-                <input
-                  type="range"
-                  min={1}
-                  max={10}
-                  step={1}
-                  value={settings.maxDepth}
-                  onChange={(e) => updateSetting('maxDepth', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Node Size Scale: {settings.nodeSizeScale.toFixed(1)}</div>
-                <input
-                  type="range"
-                  min={0.5}
-                  max={30}
-                  step={0.5}
-                  value={settings.nodeSizeScale}
-                  onChange={(e) => updateSetting('nodeSizeScale', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Folder Boost: {settings.folderSizeBoost.toFixed(2)}</div>
-                <input
-                  type="range"
-                  min={1}
-                  max={3}
-                  step={0.05}
-                  value={settings.folderSizeBoost}
-                  onChange={(e) => updateSetting('folderSizeBoost', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Glow: {settings.nodeGlow.toFixed(2)}</div>
-                <input
-                  type="range"
-                  min={0}
-                  max={2.5}
-                  step={0.05}
-                  value={settings.nodeGlow}
-                  onChange={(e) => updateSetting('nodeGlow', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Link Opacity: {settings.linkOpacity.toFixed(2)}</div>
-                <input
-                  type="range"
-                  min={0.05}
-                  max={1}
-                  step={0.05}
-                  value={settings.linkOpacity}
-                  onChange={(e) => updateSetting('linkOpacity', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Link Width: {settings.linkWidth.toFixed(2)}</div>
-                <input
-                  type="range"
-                  min={0.2}
-                  max={3}
-                  step={0.1}
-                  value={settings.linkWidth}
-                  onChange={(e) => updateSetting('linkWidth', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Charge Strength: {settings.chargeStrength}</div>
-                <input
-                  type="range"
-                  min={-400}
-                  max={-5}
-                  step={5}
-                  value={settings.chargeStrength}
-                  onChange={(e) => updateSetting('chargeStrength', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Focus Distance: {settings.focusDistance}</div>
-                <input
-                  type="range"
-                  min={30}
-                  max={160}
-                  step={2}
-                  value={settings.focusDistance}
-                  onChange={(e) => updateSetting('focusDistance', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-            <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Close Focus: {settings.focusDistanceClose}</div>
-                <input
-                  type="range"
-                  min={12}
-                  max={90}
-                  step={2}
-                  value={settings.focusDistanceClose}
-                  onChange={(e) => updateSetting('focusDistanceClose', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Auto Rotate</div>
-                    <label style={{ fontSize: '0.75rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={settings.autoRotate}
-                        onChange={(e) => updateSetting('autoRotate', e.target.checked)}
-                        style={{ marginRight: 6 }}
-                      />
-                      Enabled
-                    </label>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>
-                      Orbit Speed: {settings.autoRotateSpeed.toFixed(2)} (effective {(settings.autoRotateSpeed * ORBIT_SPEED_MULTIPLIER).toFixed(2)})
+              {rightDockTab === 'controls' && (
+                <>
+                  <div style={cardStyle}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Node Filters</div>
+                      <button
+                        onClick={() => setIsFiltersOpen((prev) => !prev)}
+                        style={{ ...buttonStyle, padding: '4px 8px', fontSize: '0.7rem' }}
+                      >
+                        {isFiltersOpen ? 'Hide' : 'Show'}
+                      </button>
                     </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={4}
-                  step={0.05}
-                  value={settings.autoRotateSpeed}
-                  onChange={(e) => updateSetting('autoRotateSpeed', Number(e.target.value))}
-                  style={sliderStyle}
-                />
+                    {isFiltersOpen && (
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 10px' }}>
+                        {(['folder', 'file', 'image', 'code', 'external'] as NodeType[]).map((type) => (
+                          <label key={type} style={{ fontSize: '0.75rem', opacity: visibleTypes[type] ? 1 : 0.5 }}>
+                            <input
+                              type="checkbox"
+                              checked={visibleTypes[type]}
+                              onChange={() => toggleTypeVisibility(type)}
+                              style={{ marginRight: 6 }}
+                            />
+                            {type.toUpperCase()}
+                          </label>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Show Labels</div>
-                    <label style={{ fontSize: '0.75rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={settings.showLabels}
-                        onChange={(e) => updateSetting('showLabels', e.target.checked)}
-                        style={{ marginRight: 6 }}
-                      />
-                      Enabled
-                    </label>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Focus Branch</div>
-                    <label style={{ fontSize: '0.75rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={settings.focusBranchMode}
-                        onChange={(e) => updateSetting('focusBranchMode', e.target.checked)}
-                        style={{ marginRight: 6 }}
-                      />
-                      Enabled
-                    </label>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Starfield</div>
-                    <label style={{ fontSize: '0.75rem' }}>
-                      <input
-                        type="checkbox"
-                        checked={settings.starfieldEnabled}
-                        onChange={(e) => updateSetting('starfieldEnabled', e.target.checked)}
-                        style={{ marginRight: 6 }}
-                      />
-                      Enabled
-                    </label>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Star Count: {Math.floor(settings.starCount)}</div>
-                <input
-                  type="range"
-                  min={0}
-                  max={12000}
-                  step={200}
-                  value={settings.starCount}
-                  onChange={(e) => updateSetting('starCount', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Star Spread: {settings.starSpread}</div>
-                <input
-                  type="range"
-                  min={600}
-                  max={6000}
-                  step={100}
-                  value={settings.starSpread}
-                  onChange={(e) => updateSetting('starSpread', Number(e.target.value))}
-                  style={sliderStyle}
-                />
-                  </div>
-            </div>
-          )}
-        </div>
 
-        <div style={sectionTitleStyle}>Dependencies</div>
-        <div style={cardStyle}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
-            <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Import Graph</div>
-            <button
-              onClick={() => parseDependencies()}
-              style={{ ...buttonStyle, padding: '4px 8px', fontSize: '0.7rem', opacity: isParsingDeps ? 0.6 : 1 }}
-              disabled={isParsingDeps}
-            >
-              {isParsingDeps ? 'Parsing...' : 'Parse'}
-            </button>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            <label style={{ fontSize: '0.75rem' }}>
-              <input
-                type="checkbox"
-                checked={settings.showDependencyEdges}
-                onChange={(e) => updateSetting('showDependencyEdges', e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Show dependency edges
-            </label>
-            <label style={{ fontSize: '0.75rem' }}>
-              <input
-                type="checkbox"
-                checked={settings.autoParseDependencies}
-                onChange={(e) => updateSetting('autoParseDependencies', e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Auto-parse on mount
-            </label>
-            <label style={{ fontSize: '0.75rem' }}>
-              <input
-                type="checkbox"
-                checked={settings.includeNodeModules}
-                onChange={(e) => updateSetting('includeNodeModules', e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Include node_modules
-            </label>
-            <label style={{ fontSize: '0.75rem' }}>
-              <input
-                type="checkbox"
-                checked={settings.groupExternalDeps}
-                onChange={(e) => updateSetting('groupExternalDeps', e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Group external deps
-            </label>
-            <div>
-              <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>
-                Max files: {settings.maxDependencyFiles}
-              </div>
-              <input
-                type="range"
-                min={50}
-                max={1500}
-                step={50}
-                value={settings.maxDependencyFiles}
-                onChange={(e) => updateSetting('maxDependencyFiles', Number(e.target.value))}
-                style={sliderStyle}
-              />
-            </div>
-            <div>
-              <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>
-                Max file size: {settings.maxDependencyFileSizeKb} KB
-              </div>
-              <input
-                type="range"
-                min={64}
-                max={2048}
-                step={64}
-                value={settings.maxDependencyFileSizeKb}
-                onChange={(e) => updateSetting('maxDependencyFileSizeKb', Number(e.target.value))}
-                style={sliderStyle}
-              />
-            </div>
-            {dependencyStats && (
-              <div style={{ fontSize: '0.7rem', color: '#7f96b2', lineHeight: 1.45 }}>
-                <div>
-                  Parsed {dependencyStats.filesParsed} files, {dependencyStats.depLinks} edges, {dependencyStats.externalCount} externals
-                </div>
-                {(dependencyStats.analyzedFiles !== undefined || dependencyStats.symbolCount !== undefined || dependencyStats.packageCount !== undefined || dependencyStats.headingCount !== undefined) && (
-                  <div>
-                    Parsed text: {dependencyStats.analyzedFiles ?? 0} | Symbols: {dependencyStats.symbolCount ?? 0} | Manifests: {dependencyStats.packageCount ?? 0} | Headings: {dependencyStats.headingCount ?? 0}
+                  <div style={cardStyle}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <div style={{ fontSize: '0.75rem', color: '#9eb2cc' }}>Environment</div>
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Charge Strength: {settings.chargeStrength}</div>
+                        <input type="range" min={-400} max={-5} step={5} value={settings.chargeStrength} onChange={(e) => updateSetting('chargeStrength', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Node Glow: {settings.nodeGlow.toFixed(2)}</div>
+                        <input type="range" min={0} max={2.5} step={0.05} value={settings.nodeGlow} onChange={(e) => updateSetting('nodeGlow', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Link Opacity: {settings.linkOpacity.toFixed(2)}</div>
+                        <input type="range" min={0.05} max={1} step={0.05} value={settings.linkOpacity} onChange={(e) => updateSetting('linkOpacity', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Link Width: {settings.linkWidth.toFixed(2)}</div>
+                        <input type="range" min={0.2} max={3} step={0.1} value={settings.linkWidth} onChange={(e) => updateSetting('linkWidth', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Node Size Scale: {settings.nodeSizeScale.toFixed(1)}</div>
+                        <input type="range" min={0.5} max={30} step={0.5} value={settings.nodeSizeScale} onChange={(e) => updateSetting('nodeSizeScale', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Pulse Interval: {settings.pulseIntervalMs} ms</div>
+                        <input type="range" min={200} max={3000} step={50} value={settings.pulseIntervalMs} onChange={(e) => updateSetting('pulseIntervalMs', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                    </div>
                   </div>
-                )}
-              </div>
-            )}
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: '6px', marginTop: '4px' }}>
-              <button
-                style={buttonStyle}
-                disabled={!selectedNode}
-                onClick={isIsolationActive ? resetIsolation : isolateSelection}
-              >
-                {isIsolationActive ? 'Exit isolation' : 'Show connected view'}
-              </button>
-              {isIsolationActive && (
-                <div style={{ fontSize: '0.7rem', color: '#7f96b2', alignSelf: 'center' }}>
-                  Showing {isolationSet?.size ?? 0} node{(isolationSet?.size ?? 0) === 1 ? '' : 's'}
-                </div>
+
+                  <div style={cardStyle}>
+                    <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>Stars</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      <label style={{ fontSize: '0.75rem' }}>
+                        <input
+                          type="checkbox"
+                          checked={settings.starfieldEnabled}
+                          onChange={(e) => updateSetting('starfieldEnabled', e.target.checked)}
+                          style={{ marginRight: 6 }}
+                        />
+                        Starfield enabled
+                      </label>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Star Count: {Math.floor(settings.starCount)}</div>
+                        <input type="range" min={0} max={12000} step={200} value={settings.starCount} onChange={(e) => updateSetting('starCount', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Star Spread: {settings.starSpread}</div>
+                        <input type="range" min={600} max={6000} step={100} value={settings.starSpread} onChange={(e) => updateSetting('starSpread', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Star Opacity: {settings.starOpacity.toFixed(2)}</div>
+                        <input type="range" min={0.05} max={1} step={0.05} value={settings.starOpacity} onChange={(e) => updateSetting('starOpacity', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                      <div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.7 }}>Star Size: {settings.starSize.toFixed(2)}</div>
+                        <input type="range" min={0.2} max={3} step={0.05} value={settings.starSize} onChange={(e) => updateSetting('starSize', Number(e.target.value))} style={sliderStyle} />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={cardStyle}>
+                    <div style={{ fontSize: '0.75rem', color: '#9eb2cc', marginBottom: '8px' }}>Pulse Trace</div>
+                    <div style={{ fontSize: '0.72rem', color: '#7f96b2', marginBottom: '8px' }}>
+                      {pulseStatus || 'Select a node to trace dependency pulses.'}
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button style={accentButtonStyle} onClick={handleStartPulseTrace} disabled={!selectedNode}>
+                        Start Pulse
+                      </button>
+                      <button style={buttonStyle} onClick={handleStopPulseTrace} disabled={!isPulseActive}>
+                        Stop Pulse
+                      </button>
+                      <button style={buttonStyle} onClick={() => fgRef.current?.d3ReheatSimulation()}>Reheat</button>
+                      <button style={buttonStyle} onClick={resetCamera}>Fit View</button>
+                    </div>
+                  </div>
+                </>
               )}
-            </div>
-
-        <div style={sectionTitleStyle}>Actions</div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-          <button style={buttonStyle} onClick={expandAllFolders}>Expand All</button>
-          <button style={buttonStyle} onClick={collapseToRoot}>Collapse Root</button>
-              <button style={buttonStyle} onClick={() => fgRef.current?.d3ReheatSimulation()}>Reheat</button>
-              <button style={buttonStyle} onClick={resetCamera}>Fit View</button>
             </div>
           </>
         )}
@@ -3046,12 +2747,12 @@ const NeuralExplorer3D: React.FC = () => {
             position: 'absolute',
             top: 0,
             left: 0,
-            width: 10,
+            width: 12,
             bottom: 0,
             cursor: 'col-resize',
             zIndex: 35,
-            opacity: isRightCollapsed ? 0.7 : 0.35,
-            background: 'linear-gradient(90deg, rgba(0, 255, 255, 0.35), rgba(0, 255, 255, 0))',
+            opacity: isRightCollapsed ? 0.75 : 0.45,
+            background: 'linear-gradient(90deg, rgba(110, 210, 255, 0.42), rgba(110, 210, 255, 0))',
           }}
         />
       </div>
@@ -3062,8 +2763,8 @@ const NeuralExplorer3D: React.FC = () => {
           style={{
             position: 'absolute',
             inset: 0,
-            background: 'rgba(5, 8, 14, 0.7)',
-            backdropFilter: 'blur(8px)',
+            background: 'rgba(5, 8, 14, 0.45)',
+            backdropFilter: 'blur(14px) saturate(120%)',
             zIndex: 80,
             pointerEvents: 'none',
             display: 'flex',
@@ -3083,10 +2784,11 @@ const NeuralExplorer3D: React.FC = () => {
               display: 'flex',
               flexDirection: 'column',
               gap: '14px',
-              background: 'rgba(12, 18, 32, 0.96)',
+              background: 'linear-gradient(160deg, rgba(15, 28, 50, 0.68), rgba(8, 14, 24, 0.56))',
               borderRadius: '18px',
-              border: '1px solid rgba(255, 255, 255, 0.12)',
-              boxShadow: '0 28px 60px rgba(0, 0, 0, 0.55)',
+              border: '1px solid rgba(160, 220, 255, 0.26)',
+              boxShadow: '0 28px 60px rgba(0, 0, 0, 0.42)',
+              backdropFilter: 'blur(18px) saturate(125%)',
               padding: '22px',
               marginTop: '6vh',
             }}
@@ -3104,25 +2806,65 @@ const NeuralExplorer3D: React.FC = () => {
               <>
                 {editorContent !== null ? (
                   <>
-                    <textarea
-                      value={editorContent}
-                      onChange={(e) => handleEditorChange(e.target.value)}
-                      disabled={isEditorLoading}
+                    <div
                       style={{
                         width: '100%',
                         minHeight: '320px',
                         flex: 1,
                         borderRadius: '12px',
-                        border: '1px solid rgba(255, 255, 255, 0.08)',
-                        background: 'rgba(4, 6, 12, 0.9)',
-                        color: '#e0f0ff',
-                        padding: '12px',
-                        fontSize: '0.82rem',
-                        fontFamily: 'Consolas, \"SFMono-Regular\", \"Segoe UI\", monospace',
-                        resize: 'none',
-                        lineHeight: 1.5,
+                        border: '1px solid rgba(180, 230, 255, 0.2)',
+                        background: 'rgba(4, 10, 20, 0.48)',
+                        backdropFilter: 'blur(10px) saturate(120%)',
+                        display: 'grid',
+                        gridTemplateColumns: '60px 1fr',
+                        overflow: 'hidden',
                       }}
-                    />
+                    >
+                      <pre
+                        ref={modalEditorLinesRef}
+                        style={{
+                          margin: 0,
+                          padding: '12px 8px 12px 0',
+                          textAlign: 'right',
+                          fontSize: '0.76rem',
+                          color: '#8ba8c6',
+                          fontFamily: 'Consolas, "SFMono-Regular", "Segoe UI", monospace',
+                          lineHeight: 1.5,
+                          userSelect: 'none',
+                          overflow: 'hidden',
+                          borderRight: '1px solid rgba(255, 255, 255, 0.09)',
+                          background: 'rgba(16, 26, 44, 0.45)',
+                        }}
+                      >
+                        {editorLineNumbers}
+                      </pre>
+                      <textarea
+                        ref={modalEditorRef}
+                        value={editorContent}
+                        onChange={(e) => handleEditorChange(e.target.value)}
+                        onScroll={() => syncEditorLineScroll('modal')}
+                        onSelect={(e) => handleEditorCursorUpdate((e.target as HTMLTextAreaElement).selectionStart)}
+                        onKeyUp={(e) => handleEditorCursorUpdate((e.target as HTMLTextAreaElement).selectionStart)}
+                        onClick={(e) => handleEditorCursorUpdate((e.target as HTMLTextAreaElement).selectionStart)}
+                        disabled={isEditorLoading}
+                        spellCheck={false}
+                        wrap="off"
+                        style={{
+                          width: '100%',
+                          minHeight: '320px',
+                          flex: 1,
+                          border: 'none',
+                          background: 'transparent',
+                          color: '#e0f0ff',
+                          padding: '12px',
+                          fontSize: '0.82rem',
+                          fontFamily: 'Consolas, "SFMono-Regular", "Segoe UI", monospace',
+                          resize: 'none',
+                          lineHeight: 1.5,
+                          outline: 'none',
+                        }}
+                      />
+                    </div>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px' }}>
                       <div style={{ fontSize: '0.75rem', color: '#7f96b2' }}>
                         {isEditorLoading
@@ -3131,6 +2873,7 @@ const NeuralExplorer3D: React.FC = () => {
                             ? 'Unsaved changes'
                             : 'In sync'}
                         {editorStatus ? ` | ${editorStatus}` : ''}
+                        {` | Ln ${editorCursor.line}, Col ${editorCursor.column}`}
                       </div>
                       <div style={{ display: 'flex', gap: '8px' }}>
                         <button
@@ -3275,7 +3018,7 @@ const NeuralExplorer3D: React.FC = () => {
                       </div>
                       <div
                         style={{
-                          maxHeight: '220px',
+                          maxHeight: '300px',
                           overflowY: 'auto',
                           borderRadius: '8px',
                           background: 'rgba(0, 0, 0, 0.35)',
@@ -3308,6 +3051,17 @@ const NeuralExplorer3D: React.FC = () => {
                             >
                               <strong style={{ color: '#c9f0ff' }}>{message.role === 'assistant' ? 'Model' : 'You'}:</strong>{' '}
                               {message.content}
+                              {message.role === 'assistant' && (
+                                <div style={{ marginTop: '6px' }}>
+                                  <button
+                                    style={buttonStyle}
+                                    onClick={() => handleApplyAssistantCode(message.content)}
+                                    disabled={isChattingWithModel || editorContent === null}
+                                  >
+                                    Apply Code To Editor
+                                  </button>
+                                </div>
+                              )}
                             </div>
                           ))
                         )}
@@ -3346,15 +3100,32 @@ const NeuralExplorer3D: React.FC = () => {
                         >
                           Clear
                         </button>
+                        <button
+                          style={buttonStyle}
+                          onClick={handleApplyLatestAssistantCode}
+                          disabled={isChattingWithModel || chatMessages.length === 0 || editorContent === null}
+                        >
+                          Apply Latest Code
+                        </button>
                       </div>
                       {chatStatus && (
                         <div style={{ fontSize: '0.72rem', color: '#9db3d3' }}>
                           {chatStatus}
                         </div>
                       )}
+                      {chatApplyStatus && (
+                        <div style={{ fontSize: '0.72rem', color: '#9ff6bf' }}>
+                          {chatApplyStatus}
+                        </div>
+                      )}
                       {chatError && (
                         <div style={{ fontSize: '0.72rem', color: '#ff7a7a' }}>
                           {chatError}
+                        </div>
+                      )}
+                      {chatApplyError && (
+                        <div style={{ fontSize: '0.72rem', color: '#ff9b9b' }}>
+                          {chatApplyError}
                         </div>
                       )}
                     </div>
@@ -3553,3 +3324,4 @@ const NeuralExplorer3D: React.FC = () => {
 };
 
 export default NeuralExplorer3D;
+
