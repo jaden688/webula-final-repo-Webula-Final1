@@ -464,9 +464,14 @@ const NeuralExplorer3D: React.FC = () => {
   const [openaiModel, setOpenaiModel] = useState<string>(() => (
     loadStoredText(OPENAI_MODEL_STORAGE_KEY, loadStoredText(LEGACY_CLOUD_MODEL_STORAGE_KEY, DEFAULT_OPENAI_MODEL))
   ));
-  const [geminiModel, setGeminiModel] = useState<string>(() => (
-    loadStoredText(GEMINI_MODEL_STORAGE_KEY, DEFAULT_GEMINI_MODEL)
-  ));
+  const [geminiModel, setGeminiModel] = useState<string>(() => {
+    const stored = loadStoredText(GEMINI_MODEL_STORAGE_KEY, DEFAULT_GEMINI_MODEL).trim();
+    const lower = stored.toLowerCase();
+    if (!stored || lower.startsWith('gpt-') || lower.startsWith('claude-') || lower.startsWith('gemini-1.5')) {
+      return DEFAULT_GEMINI_MODEL;
+    }
+    return stored;
+  });
   const [anthropicModel, setAnthropicModel] = useState<string>(() => (
     loadStoredText(ANTHROPIC_MODEL_STORAGE_KEY, DEFAULT_ANTHROPIC_MODEL)
   ));
